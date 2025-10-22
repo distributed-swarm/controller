@@ -1,9 +1,8 @@
 name: publish
+
 on:
   push:
     branches: [ "main" ]
-  release:
-    types: [ published ]
   workflow_dispatch:
 
 permissions:
@@ -11,7 +10,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE: ghcr.io/${{ github.repository }}   # ghcr.io/distributed-swarm/controller
+  IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
   build-and-push:
@@ -26,28 +25,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker meta (tags + labels)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE }}
-          tags: |
-            # immutable short SHA on every build
-            type=sha,format=short
-            # moving tag for default branch builds only
-            type=raw,value=main,enable={{is_default_branch}}
-            # semver tag only on release events
-            type=semver,pattern={{version}},enable={{is_tag}}
-          labels: |
-            org.opencontainers.image.source=${{ github.repositoryUrl }}
-            org.opencontainers.image.revision=${{ github.sha }}
+      - name: Short SHA
+        run: echo "SHORT_SHA=${GITHUB_SHA::7}" >> $GITHUB_ENV
 
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: |
+            ${{ env.IMAGE }}:main
+            ${{ env.IMAGE }}:${{ env.SHORT_SHA }}
