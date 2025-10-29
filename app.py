@@ -1,72 +1,49 @@
-# app.py — controller heartbeat MVP
-
-from fastapi import FastAPI, Request, HTTPException
+# app.py — minimal controller: health, task queue, results
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-from typing import Dict, Optional
-from datetime import datetime, timezone, timedelta
+from pydantic import BaseModel
+from typing import Optional, List, Dict
+import hashlib, time, uuid
 
-app = FastAPI(title="distributed-swarm controller")
+app = FastAPI()
+queue: List[Dict] = []         # in-memory task queue (tiny, on purpose)
+results: Dict[str, Dict] = {}  # in-memory results store
 
-# In-memory registry of agents. Later you can swap this for Redis/Postgres.
-class Heartbeat(BaseModel):
-    agent_name: str = Field(..., description="Unique agent name, e.g., agent-1")
-    ip: Optional[str] = Field(None, description="Agent container IP (optional)")
-    cpu: Optional[float] = Field(None, description="CPU percent (optional)")
-    mem: Optional[float] = Field(None, description="Memory percent (optional)")
-    gpu: Optional[str] = Field(None, description="GPU brief summary (optional)")
-
-class AgentView(BaseModel):
-    agent_name: str
-    last_seen: str
-    seconds_since: float
-    ip: Optional[str] = None
-    cpu: Optional[float] = None
-    mem: Optional[float] = None
-    gpu: Optional[str] = None
-
-REGISTRY: Dict[str, Dict] = {}
-
-def utc_now():
-    return datetime.now(timezone.utc)
+class Result(BaseModel):
+    id: str
+    agent: str
+    ok: bool
+    output: Optional[str] = None
+    duration_ms: Optional[int] = None
+    error: Optional[str] = None
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok", "time": utc_now().isoformat()}
+    return {"status": "ok", "time": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
 
-@app.post("/heartbeat")
-async def heartbeat(hb: Heartbeat, request: Request):
-    # If agent didn't send IP, infer from request
-    ip = hb.ip or request.client.host
-    REGISTRY[hb.agent_name] = {
-        "agent_name": hb.agent_name,
-        "last_seen": utc_now(),
-        "ip": ip,
-        "cpu": hb.cpu,
-        "mem": hb.mem,
-        "gpu": hb.gpu,
-    }
-    return {"ok": True}
+@app.get("/task")
+def get_task(agent: str):
+    # pop first task
+    for i, t in enumerate(queue):
+        if t.get("assigned_to") in (None, agent):
+            task = queue.pop(i)
+            task["assigned_to"] = agent
+            return task
+    return JSONResponse(status_code=204, content=None)
 
-@app.get("/agents")
-def list_agents(minutes:int = 10):
-    cutoff = utc_now() - timedelta(minutes=minutes)
-    out = []
-    for row in REGISTRY.values():
-        ts = row["last_seen"]
-        out.append(AgentView(
-            agent_name=row["agent_name"],
-            last_seen=ts.isoformat(),
-            seconds_since=(utc_now() - ts).total_seconds(),
-            ip=row.get("ip"),
-            cpu=row.get("cpu"),
-            mem=row.get("mem"),
-            gpu=row.get("gpu"),
-        ))
-    # Sort newest first
-    out.sort(key=lambda x: x.seconds_since)
-    return JSONResponse([o.dict() for o in out])
+@app.post("/result")
+def post_result(r: Result):
+    results[r.id] = r.dict()
+    return {"stored": True}
 
-@app.get("/")
-def root():
-    return {"service": "controller", "routes": ["/healthz", "/heartbeat (POST)", "/agents"]}
+# Testing helpers
+@app.post("/seed")
+def seed(n: int = 5, op: str = "sha256", payload: str = "hello-world"):
+    for _ in range(n):
+        tid = f"tsk-{uuid.uuid4().hex[:8]}"
+        queue.append({"id": tid, "op": op, "payload": payload})
+    return {"queued": n, "op": op}
+
+@app.get("/results")
+def all_results():
+    return results
