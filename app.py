@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 import hashlib, time, uuid
+from starlette.responses import Response
 
 app = FastAPI()
 queue: List[Dict] = []         # in-memory task queue (tiny, on purpose)
@@ -29,7 +30,7 @@ def get_task(agent: str):
             task = queue.pop(i)
             task["assigned_to"] = agent
             return task
-    return JSONResponse(status_code=204, content=None)
+    return Response(status_code=204)
 
 @app.post("/result")
 def post_result(r: Result):
