@@ -39,11 +39,13 @@ def post_result(r: Result):
 
 # Testing helpers
 @app.post("/seed")
-def seed(n: int = 5, op: str = "sha256", payload: str = "hello-world"):
-    for _ in range(n):
+def seed(data: dict):
+    items = data.get("items", [])
+    op = data.get("task", "sha256")
+    for item in items:
         tid = f"tsk-{uuid.uuid4().hex[:8]}"
-        queue.append({"id": tid, "op": op, "payload": payload})
-    return {"queued": n, "op": op}
+        queue.append({"id": tid, "op": op, "payload": item})
+    return {"queued": len(items), "op": op}
 
 @app.get("/results")
 def all_results():
