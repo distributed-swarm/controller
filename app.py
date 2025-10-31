@@ -25,13 +25,20 @@ def healthz():
     return {"status": "ok", "time": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
 
 @app.get("/task")
-def get_task(agent: str):
-    # pop first task
-    for i, t in enumerate(queue):
-        if t.get("assigned_to") in (None, agent):
-            task = queue.pop(i)
-            task["assigned_to"] = agent
-            return task
+async def get_task(agent: str, wait_ms: int = 2000):
+    """
+    Long-poll for a task up to wait_ms, prefer tasks unassigned or already assigned to this agent.
+    Returns 204 if no work after the wait window.
+    """
+    deadline = time.time() + (wait_ms / 1000.0)
+    while time.time() < deadline:
+        for i, t in enumerate(queue):
+            if t.get("assigned_to") in (None, agent):
+                task = queue.pop(i)
+                task["assigned_to"] = agent
+                return task
+        # nothing yet; yield briefly to avoid hot-looping
+        await asyncio.sleep(0.02)
     return Response(status_code=204)
 
 @app.post("/result")
