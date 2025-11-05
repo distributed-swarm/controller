@@ -1,6 +1,6 @@
 # app.py — minimal controller: health, task queue, results (stable, lenient I/O)
 
-from fastapi import FastAPI, HTTPException, Body, Query
+from fastapi import FastAPI, HTTPException, Body, Query, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
@@ -56,7 +56,7 @@ async def get_task(
 
     if empty == 1:
         return JSONResponse({}, status_code=200)
-    return JSONResponse(status_code=204, content=None)
+    return Response(status_code=204)  # 204 must have no body
 
 # ---------- Result ingest ----------
 @app.post("/result")
@@ -76,8 +76,7 @@ def post_result(r: Dict[str, Any] = Body(...)):
         "output": r.get("output"),
         "duration_ms": r.get("duration_ms"),
         "error": r.get("error"),
-        # stash raw just in case
-        "_raw": r,
+        "_raw": r,  # stash raw just in case
         "ts": time.time(),
     }
     results[rec["id"]] = rec
@@ -110,8 +109,8 @@ def seed(payload: Dict[str, Any] = Body(...)):
     for _ in range(model.count):
         tid = f"tsk-{uuid.uuid4().hex[:8]}"
         # minimal synthetic payload for sha256 work; agents can ignore if they generate their own
-        payload = uuid.uuid4().hex.encode()
-        queue.append({"id": tid, "op": op, "payload": payload.hex()})
+        data = uuid.uuid4().hex.encode()
+        queue.append({"id": tid, "op": op, "payload": data.hex()})
         queued += 1
     return {"queued": queued, "op": op}
 
