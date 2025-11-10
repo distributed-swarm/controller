@@ -11,7 +11,8 @@ app = FastAPI()
 # In-memory stores
 queue: List[Dict[str, Any]] = []             # pending tasks
 results: Dict[str, Dict[str, Any]] = {}      # stored results by id
-task_meta: Dict[str, Dict[str, Any]] = {}    # id -> {"op": str, "seed_ts": float}
+task_meta: Dict[str, Dict[str, Any]] = {}    # id -> {"op": str, "seed_ts": float, ...}
+jobs: Dict[str, Dict[str, Any]] = {}         # job_id -> job record (new)
 
 # ---------- Models ----------
 class Result(BaseModel):
@@ -31,6 +32,14 @@ class SeedItems(BaseModel):
     # list format: {"items":[...], "task":"sha256"}
     items: List[Any] = Field(default_factory=list)
     task: str = Field(default="sha256")
+
+# New: typed job envelope used by submit_job
+class JobIn(BaseModel):
+    type: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    resources: Optional[Dict[str, Any]] = None
+    policy: Optional[Dict[str, Any]] = None
+    tenant: Optional[str] = "default"
 
 # ---------- Health ----------
 @app.get("/healthz")
@@ -55,6 +64,12 @@ async def get_task(
                 task = queue.pop(i)
                 task["assigned_to"] = agent
                 task["leased_at"] = time.time()
+                # mirror some meta for later tracing
+                tid = task.get("id")
+                if tid:
+                    meta = task_meta.get(tid, {})
+                    meta.update({"assigned_to": agent, "leased_at": task["leased_at"]})
+                    task_meta[tid] = meta
                 return JSONResponse(task, status_code=200)
         await asyncio.sleep(0.02)
 
@@ -98,9 +113,16 @@ def post_result(r: Dict[str, Any] = Body(...)):
         "seed_ts": meta.get("seed_ts"),
     }
     results[rid] = rec
+
+    # If this task originated from submit_job, update job status
+    job_id = meta.get("job_id")
+    if job_id and job_id in jobs:
+        jobs[job_id]["status"] = "done"
+        jobs[job_id]["result_id"] = rid
+
     return {"stored": True, "id": rid}
 
-# ---------- Seed helpers ----------
+# ---------- Seed helpers (backwards compatible) ----------
 @app.post("/seed")
 def seed(payload: Dict[str, Any] = Body(...)):
     """
@@ -131,6 +153,41 @@ def seed(payload: Dict[str, Any] = Body(...)):
         task_meta[tid] = {"op": op, "seed_ts": time.time()}
         queued += 1
     return {"queued": queued, "op": op}
+
+# ---------- New: submit typed jobs ----------
+@app.post("/submit_job")
+def submit_job(job: JobIn):
+    """
+    Accepts a typed job (e.g., {"type":"map_tokenize","payload":{"source":{"file":"..."}}, ...})
+    Enqueues a single task with id = job_id for agents to process.
+    Returns {"job_id": "...", "status": "queued"}.
+    """
+    job_id = f"tsk-{uuid.uuid4().hex[:8]}"  # align job_id with task id for simplicity
+    # enqueue one task; agent code branches on 'op' (same as job.type)
+    task = {"id": job_id, "op": job.type, "payload": job.payload, "tenant": job.tenant}
+    queue.append(task)
+
+    # record meta for tracing and later status
+    task_meta[job_id] = {"op": job.type, "seed_ts": time.time(), "job_id": job_id}
+    jobs[job_id] = {
+        "id": job_id,
+        "type": job.type,
+        "payload": job.payload,
+        "resources": job.resources,
+        "policy": job.policy,
+        "tenant": job.tenant,
+        "status": "queued",
+        "queued_ts": time.time(),
+    }
+    return {"job_id": job_id, "status": "queued"}
+
+# Optional: simple job lookup for debugging
+@app.get("/job/{job_id}")
+def job_status(job_id: str):
+    j = jobs.get(job_id)
+    if not j:
+        raise HTTPException(status_code=404, detail="job not found")
+    return j
 
 # ---------- Results dump ----------
 @app.get("/results")
