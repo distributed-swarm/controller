@@ -1,10 +1,11 @@
-# app.py — controller (GPU-aware agent registry + requires filter, backward-compatible)
+# app.py — controller (GPU-aware agent registry + lightweight 24h metrics)
 
 from fastapi import FastAPI, HTTPException, Body, Query, Response, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any, Tuple
-import time, uuid, asyncio
+from collections import deque, defaultdict
+import time, uuid, asyncio, math
 
 app = FastAPI()
 
@@ -14,6 +15,57 @@ results: Dict[str, Dict[str, Any]] = {}      # task_id -> result record
 task_meta: Dict[str, Dict[str, Any]] = {}    # task_id -> metadata (op, seed_ts, assigned_to, leased_at, job_id, requires)
 jobs: Dict[str, Dict[str, Any]] = {}         # job_id -> job record (for submit_job)
 agents: Dict[str, Dict[str, Any]] = {}       # agent_id -> {"labels":{}, "capabilities":{}, "last_seen": ts}
+
+# ----------------- Lightweight metrics (24h) -----------------
+SAMPLE_PERIOD_SEC = 1
+RETENTION_SEC = 24 * 60 * 60            # 24 hours
+MAX_POINTS = RETENTION_SEC // SAMPLE_PERIOD_SEC
+
+completed_total = 0
+failed_total = 0
+leased_total = 0
+
+# Per-second timeline of cumulative completed count and queue length.
+# Each item: (timestamp_sec, completed_total, queue_len)
+timeline = deque(maxlen=MAX_POINTS)
+
+# Per-op counters and duration aggregates (ms)
+op_counts: Dict[str, int] = defaultdict(int)
+op_dur_sum_ms: Dict[str, int] = defaultdict(int)
+op_dur_n: Dict[str, int] = defaultdict(int)
+
+def _now() -> float:
+    return time.time()
+
+def _now_s() -> int:
+    return int(_now())
+
+def _new_id() -> str:
+    return f"tsk-{uuid.uuid4().hex[:8]}"
+
+def _rate_per_sec(window_seconds: int) -> float:
+    """Compute tasks/sec over the last window_seconds using timeline."""
+    if len(timeline) < 2:
+        return 0.0
+    t1, c1, _ = timeline[-1]
+    # Walk back until we reach the window or run out
+    target = t1 - window_seconds
+    # find first index with ts >= target
+    idx = None
+    for i in range(len(timeline) - 1, -1, -1):
+        if timeline[i][0] <= target:
+            idx = i
+            break
+    if idx is None:
+        # window longer than our buffer; use earliest
+        t0, c0, _ = timeline[0]
+    else:
+        t0, c0, _ = timeline[idx]
+    dt = max(1e-6, t1 - t0)
+    return (c1 - c0) / dt
+
+def _ema_update(prev: float, value: float, alpha: float = 0.2) -> float:
+    return value if math.isnan(prev) else (alpha * value + (1 - alpha) * prev)
 
 # --------------- Models (for ergonomics) ----------
 class SeedLegacy(BaseModel):
@@ -38,25 +90,6 @@ class JobIn(BaseModel):
     requires: Optional[Dict[str, Any]] = None
 
 # --------------- Helpers ---------------------------
-def _now() -> float:
-    return time.time()
-
-def _new_id() -> str:
-    return f"tsk-{uuid.uuid4().hex[:8]}"
-
-def _normalize_single_task(op: str, payload: Any, given_id: Optional[str] = None,
-                           requires: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Return a normalized task dict the agent understands."""
-    tid = given_id or _new_id()
-    task = {"id": tid, "op": str(op), "payload": payload}
-    if requires:
-        task["requires"] = requires
-    # minimal meta for traceability
-    meta = task_meta.get(tid, {})
-    meta.update({"op": str(op), "seed_ts": _now(), "requires": requires or meta.get("requires")})
-    task_meta[tid] = meta
-    return task
-
 def _parse_capabilities(req: Request) -> Optional[List[str]]:
     """
     Read capabilities from header or query string.
@@ -138,6 +171,20 @@ def _eligible_for_agent(task: Dict[str, Any], agent_id: str, ops_advertised: Opt
     agent_rec = agents.get(agent_id)
     return _meets_requires(agent_rec, req)
 
+# ----------------- Metrics sampler -----------------
+@app.on_event("startup")
+async def _metrics_sampler_start():
+    # seed timeline immediately so stats don't look empty at boot
+    timeline.append((_now_s(), completed_total, len(queue)))
+
+    async def _sample_loop():
+        while True:
+            # append one point each second: timestamp, completed_total, current queue length
+            timeline.append((_now_s(), completed_total, len(queue)))
+            await asyncio.sleep(SAMPLE_PERIOD_SEC)
+
+    asyncio.create_task(_sample_loop())
+
 # --------------- Health ----------------------------
 @app.get("/healthz")
 def healthz():
@@ -202,6 +249,8 @@ async def get_task(
     If the task has 'requires', also check agent registry to ensure constraints are met.
     Preference: unassigned, or already assigned to this agent (retries).
     """
+    global leased_total
+
     ops_advertised = _parse_capabilities(request)  # None = accept anything (back-compat)
     deadline = _now() + (wait_ms / 1000.0)
 
@@ -226,6 +275,7 @@ async def get_task(
                     meta.update({"assigned_to": agent, "leased_at": task["leased_at"]})
                     task_meta[tid] = meta
 
+                leased_total += 1
                 return JSONResponse(task, status_code=200)
         await asyncio.sleep(0.02)
 
@@ -239,6 +289,8 @@ def post_result(r: Dict[str, Any] = Body(...)):
     """
     Accepts agent results (any superset). Normalizes and stores by task id.
     """
+    global completed_total, failed_total
+
     if "id" not in r or "agent" not in r:
         raise HTTPException(status_code=422, detail="Result must include 'id' and 'agent'")
 
@@ -250,12 +302,15 @@ def post_result(r: Dict[str, Any] = Body(...)):
     if isinstance(op, str) and op.startswith("trace-"):
         trace = op.split(".", 1)[0]
 
+    ok_flag = bool(r.get("ok", True))
+    dur_ms = int(r.get("duration_ms") or 0)
+
     rec = {
         "id": rid,
         "agent": r.get("agent"),
-        "ok": bool(r.get("ok", True)),
+        "ok": ok_flag,
         "output": r.get("output"),
-        "duration_ms": int(r.get("duration_ms") or 0),
+        "duration_ms": dur_ms,
         "error": r.get("error") or "",
         "op": op,
         "trace": trace,
@@ -267,6 +322,16 @@ def post_result(r: Dict[str, Any] = Body(...)):
         "requires": meta.get("requires"),
     }
     results[rid] = rec
+
+    # metrics
+    completed_total += 1
+    if not ok_flag:
+        failed_total += 1
+    if op:
+        op_counts[op] += 1
+        if dur_ms > 0:
+            op_dur_sum_ms[op] += dur_ms
+            op_dur_n[op] += 1
 
     job_id = meta.get("job_id")
     if job_id and job_id in jobs:
@@ -374,17 +439,88 @@ def all_results(
         items = items[-limit:]
     return {r["id"]: r for r in items}
 
+# --------------- Metrics endpoints -----------------
+@app.get("/stats")
+def stats():
+    """Snapshot plus rolling rates."""
+    rate_1s = _rate_per_sec(1)
+    rate_60s = _rate_per_sec(60)
+    rate_5m = _rate_per_sec(300)
+    rate_15m = _rate_per_sec(900)
+    latest_queue = timeline[-1][2] if timeline else len(queue)
+
+    return {
+        "time": _now_s(),
+        "agents_online": len(agents),
+        "queue_len": latest_queue,
+        "leased_total": leased_total,
+        "completed_total": completed_total,
+        "failed_total": failed_total,
+        "rate_tasks_per_sec": {
+            "1s": round(rate_1s, 3),
+            "60s": round(rate_60s, 3),
+            "5m": round(rate_5m, 3),
+            "15m": round(rate_15m, 3),
+        }
+    }
+
+@app.get("/stats/sparkline")
+def stats_sparkline(seconds: int = Query(60, ge=1, le=min(3600, RETENTION_SEC))):
+    """
+    Return per-second throughput for last N seconds as a list of {t, tps}.
+    Useful for UI charts. Light enough to poll every second.
+    """
+    if len(timeline) < 2:
+        return {"points": []}
+
+    # Build tps from deltas of completed_total between consecutive seconds
+    end_ts = timeline[-1][0]
+    start_ts = end_ts - seconds + 1
+    # Convert timeline into dict for O(1) lookups per ts
+    by_ts = {ts: comp for ts, comp, _ in timeline}
+    points = []
+    prev_comp = None
+    for ts in range(start_ts, end_ts + 1):
+        comp = by_ts.get(ts, prev_comp if prev_comp is not None else 0)
+        if prev_comp is None:
+            tps = 0.0
+        else:
+            tps = max(0.0, comp - prev_comp)
+        points.append({"t": ts, "tps": tps})
+        prev_comp = comp
+    return {"points": points}
+
+@app.get("/stats/ops")
+def stats_ops():
+    """Per-op counts and average duration in ms."""
+    data = {}
+    for op, cnt in op_counts.items():
+        n = max(1, op_dur_n.get(op, 0))
+        avg_ms = (op_dur_sum_ms.get(op, 0) / n) if op_dur_n.get(op, 0) else 0.0
+        data[op] = {"count": cnt, "avg_duration_ms": round(avg_ms, 2)}
+    return {"ops": data}
+
 # --------------- Maintenance -----------------------
 @app.post("/purge")
 def purge(all: int = 0):
     """
     POST /purge       -> clear queue only
-    POST /purge?all=1 -> clear queue + results + meta + jobs + agents (no, keep agents)
+    POST /purge?all=1 -> clear queue + results + meta + jobs (keeps agents)
+    Metrics timeline is retained (24h ring); counters are NOT reset unless all=1.
     """
+    global completed_total, failed_total, leased_total
     queue.clear()
     if all:
         results.clear()
         task_meta.clear()
         jobs.clear()
         # keep 'agents' so the registry survives between runs (in-memory anyway)
+        completed_total = 0
+        failed_total = 0
+        leased_total = 0
+        timeline.clear()
+        timeline.append((_now_s(), completed_total, len(queue)))
+        op_counts.clear()
+        op_dur_sum_ms.clear()
+        op_dur_n.clear()
     return {"purged": True, "all": bool(all), "queue_len": len(queue)}
