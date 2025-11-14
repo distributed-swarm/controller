@@ -14,87 +14,68 @@ queue: List[Dict[str, Any]] = []             # pending tasks; normalized: {"id",
 results: Dict[str, Dict[str, Any]] = {}      # task_id -> result record
 task_meta: Dict[str, Dict[str, Any]] = {}    # task_id -> metadata (op, seed_ts, assigned_to, leased_at, job_id, requires)
 jobs: Dict[str, Dict[str, Any]] = {}         # job_id -> job record (for submit_job)
-agents: Dict[str, Dict[str, Any]] = {}       # agent_id -> {"labels":{}, "capabilities":{}, "last_seen": ts}
 
-# ----------------- Lightweight metrics (24h) -----------------
-SAMPLE_PERIOD_SEC = 1
-RETENTION_SEC = 24 * 60 * 60            # 24 hours
-MAX_POINTS = RETENTION_SEC // SAMPLE_PERIOD_SEC
-
+# 24h metrics: we track per-second completed counts for rolling rates
+TIMELINE_MAX_SECS = 24 * 60 * 60
+timeline: deque = deque(maxlen=TIMELINE_MAX_SECS)  # (timestamp_sec, completed_total, queue_len)
 completed_total = 0
 failed_total = 0
 leased_total = 0
 
-# Per-second timeline of cumulative completed count and queue length.
-# Each item: (timestamp_sec, completed_total, queue_len)
-timeline = deque(maxlen=MAX_POINTS)
-
-# Per-op counters and duration aggregates (ms)
+# op-level aggregates
 op_counts: Dict[str, int] = defaultdict(int)
-op_dur_sum_ms: Dict[str, int] = defaultdict(int)
+op_dur_sum_ms: Dict[str, float] = defaultdict(float)
 op_dur_n: Dict[str, int] = defaultdict(int)
+
+# agent registry: {agent_id: {"labels": {...}, "capabilities": {...}, "last_seen": ts}}
+agents: Dict[str, Dict[str, Any]] = {}
+
+# ---------------- Helpers ----------------
 
 def _now() -> float:
     return time.time()
 
 def _now_s() -> int:
-    return int(_now())
+    return int(time.time())
 
 def _new_id() -> str:
-    return f"tsk-{uuid.uuid4().hex[:8]}"
+    return uuid.uuid4().hex
 
-def _rate_per_sec(window_seconds: int) -> float:
-    """Compute tasks/sec over the last window_seconds using timeline."""
-    if len(timeline) < 2:
-        return 0.0
-    t1, c1, _ = timeline[-1]
-    # Walk back until we reach the window or run out
-    target = t1 - window_seconds
-    # find first index with ts >= target
-    idx = None
-    for i in range(len(timeline) - 1, -1, -1):
-        if timeline[i][0] <= target:
-            idx = i
-            break
-    if idx is None:
-        # window longer than our buffer; use earliest
-        t0, c0, _ = timeline[0]
+def _update_timeline():
+    """Append a point each time we finish a task."""
+    if not timeline:
+        timeline.append((_now_s(), completed_total, len(queue)))
     else:
-        t0, c0, _ = timeline[idx]
-    dt = max(1e-6, t1 - t0)
-    return (c1 - c0) / dt
+        last_ts, _, _ = timeline[-1]
+        now_ts = _now_s()
+        if now_ts != last_ts:
+            timeline.append((now_ts, completed_total, len(queue)))
 
-def _ema_update(prev: float, value: float, alpha: float = 0.2) -> float:
-    return value if math.isnan(prev) else (alpha * value + (1 - alpha) * prev)
+def _rate_per_sec(window_s: int) -> float:
+    """Return completed tasks/sec over the last window_s seconds."""
+    if not timeline:
+        return 0.0
+    now_ts = _now_s()
+    cutoff = now_ts - window_s
+    # find first point >= cutoff
+    start_idx = None
+    for i, (ts, _, _) in enumerate(timeline):
+        if ts >= cutoff:
+            start_idx = i
+            break
+    if start_idx is None:
+        # all points older than cutoff
+        return 0.0
+    start_ts, start_completed, _ = timeline[start_idx]
+    end_ts, end_completed, _ = timeline[-1]
+    dt = max(end_ts - start_ts, 1)
+    return (end_completed - start_completed) / dt
 
-# --------------- Models (for ergonomics) ----------
-class SeedLegacy(BaseModel):
-    # {"type":"sha256","count":5}
-    type: str = Field(default="sha256")
-    count: int = Field(ge=0, le=100000, default=0)
-    requires: Optional[Dict[str, Any]] = None
-
-class SeedItems(BaseModel):
-    # {"items":[...], "task":"sha256", "requires": {...}}
-    items: List[Any] = Field(default_factory=list)
-    task: str = Field(default="sha256")
-    requires: Optional[Dict[str, Any]] = None
-
-class JobIn(BaseModel):
-    # {"type":"map_tokenize","payload":{...}, "requires": {...}}
-    type: str
-    payload: Dict[str, Any] = Field(default_factory=dict)
-    resources: Optional[Dict[str, Any]] = None
-    policy: Optional[Dict[str, Any]] = None
-    tenant: Optional[str] = "default"
-    requires: Optional[Dict[str, Any]] = None
-
-# --------------- Helpers ---------------------------
 def _parse_capabilities(req: Request) -> Optional[List[str]]:
     """
-    Read capabilities from header or query string.
-    Header: X-Tasks: sha256,trace,map_tokenize
-    Query:  ?ops=sha256,trace,map_tokenize
+    Agents can advertise which ops they support via:
+      Header: X-Tasks: sha256,trace,map_tokenize
+      Query:  ?ops=sha256,trace,map_tokenize
     """
     caps = req.headers.get("X-Tasks") or req.query_params.get("ops") or ""
     caps = [c.strip() for c in caps.split(",") if c.strip()]
@@ -123,79 +104,62 @@ def _meets_requires(agent_rec: Optional[Dict[str, Any]], requires: Optional[Dict
         return True
 
     caps = (agent_rec or {}).get("capabilities", {})
-    gpu = caps.get("gpu", {}) if isinstance(caps, dict) else {}
+    gpu_caps = caps.get("gpu") or {}
+    labels = (agent_rec or {}).get("labels") or {}
 
-    # requires.gpu: bool
-    want_gpu = requires.get("gpu")
-    if want_gpu is True and not gpu.get("present"):
+    # GPU presence
+    need_gpu = requires.get("gpu")
+    if need_gpu is True and not gpu_caps.get("present"):
         return False
 
-    # requires.min_vram_mb
-    mv = requires.get("min_vram_mb") or requires.get("vram_mb")
-    if mv is not None:
-        try:
-            actual = int(gpu.get("vram_mb") or 0)
-            if actual < int(mv):
+    # Min VRAM
+    min_vram = requires.get("min_vram_mb")
+    if isinstance(min_vram, (int, float)) and isinstance(gpu_caps.get("vram_mb"), (int, float)):
+        if gpu_caps["vram_mb"] < min_vram:
+            return False
+
+    # Min CUDA
+    min_cuda = requires.get("min_cuda")
+    if isinstance(min_cuda, str) and isinstance(gpu_caps.get("cuda_version"), str):
+        if _tuple_ver(gpu_caps["cuda_version"]) < _tuple_ver(min_cuda):
+            return False
+
+    # Precision hints (not enforced strictly, but we can deny if impossible)
+    for prec in ("fp16", "bf16"):
+        req_val = requires.get(prec)
+        if req_val is True:
+            if gpu_caps.get("present") and gpu_caps.get(prec) is False:
                 return False
-        except Exception:
-            return False
 
-    # requires.min_cuda
-    min_cuda = requires.get("min_cuda") or requires.get("cuda")
-    if min_cuda:
-        agent_cuda = str(gpu.get("cuda_version") or "0.0")
-        if _tuple_ver(agent_cuda) < _tuple_ver(str(min_cuda)):
-            return False
-
-    # requires.fp16 / bf16
-    for k in ("fp16", "bf16"):
-        if requires.get(k) is True and not bool(gpu.get(k)):
-            return False
-
-    # requires.labels: all must match exactly as strings
-    want_labels = requires.get("labels")
-    if isinstance(want_labels, dict):
-        labels = (agent_rec or {}).get("labels", {})
-        for k, v in want_labels.items():
-            if str(labels.get(k)) != str(v):
+    # Label match: requires.labels = {k:v} means agent.labels[k] == v
+    req_labels = requires.get("labels")
+    if isinstance(req_labels, dict):
+        for k, v in req_labels.items():
+            if labels.get(k) != v:
                 return False
 
     return True
 
-def _eligible_for_agent(task: Dict[str, Any], agent_id: str, ops_advertised: Optional[List[str]]) -> bool:
-    # op filter (header-advertised)
-    if ops_advertised is not None and task.get("op") not in ops_advertised:
-        return False
-    # requires filter (GPU + labels + etc.)
-    req = task.get("requires") or task_meta.get(task.get("id", ""), {}).get("requires")
-    agent_rec = agents.get(agent_id)
-    return _meets_requires(agent_rec, req)
+# --------------- Models (for ergonomics) ----------
+class SeedLegacy(BaseModel):
+    # {"type":"sha256","count":5}
+    type: str = Field(default="sha256")
+    count: int = Field(ge=0, le=100000, default=0)
+    requires: Optional[Dict[str, Any]] = None
 
-# ----------------- Metrics sampler -----------------
-@app.on_event("startup")
-async def _metrics_sampler_start():
-    # seed timeline immediately so stats don't look empty at boot
-    timeline.append((_now_s(), completed_total, len(queue)))
+class SeedItems(BaseModel):
+    # {"items":[...], "task":"sha256", "requires": {...}}
+    items: List[Any] = Field(default_factory=list)
+    task: str = Field(default="sha256")
+    requires: Optional[Dict[str, Any]] = None
 
-    async def _sample_loop():
-        while True:
-            # append one point each second: timestamp, completed_total, current queue length
-            timeline.append((_now_s(), completed_total, len(queue)))
-            await asyncio.sleep(SAMPLE_PERIOD_SEC)
+class JobIn(BaseModel):
+    # {"type":"map_tokenize","payload":{...}, "requires": {...}}  (compat with trainer)
+    type: str
+    payload: Dict[str, Any]
+    requires: Optional[Dict[str, Any]] = None
 
-    asyncio.create_task(_sample_loop())
-
-# --------------- Health ----------------------------
-@app.get("/healthz")
-def healthz():
-    return {
-        "status": "ok",
-        "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "agents_online": len(agents),
-        "queue_len": len(queue),
-    }
-
-# --------------- Agent registry --------------------
+# --------------- Agent registry endpoints ----------------
 @app.post("/agents/register")
 def agents_register(payload: Dict[str, Any] = Body(...)):
     """
@@ -233,7 +197,7 @@ def agents_heartbeat(payload: Dict[str, Any] = Body(...)):
 @app.get("/agents")
 def list_agents():
     """Debug view of registered agents."""
-    return {aid: {**rec, "capabilities": rec.get("capabilities", {})} for aid, rec in agents.items()}
+    return agents
 
 # --------------- Task leasing (simple, back-compat) ------------
 @app.get("/task")
@@ -260,63 +224,67 @@ async def get_task(
             # capability/op check
             if ops_advertised is not None and t.get("op") not in ops_advertised:
                 continue
+            
             # requires check
-            if not _eligible_for_agent(t, agent, ops_advertised):
+            requires = _parse_requires(t)
+            agent_rec = agents.get(agent)
+            if not _meets_requires(agent_rec, requires):
                 continue
-            # assignment preference
-            if t.get("assigned_to") in (None, agent):
-                task = queue.pop(i)
-                task["assigned_to"] = agent
-                task["leased_at"] = _now()
 
-                tid = task.get("id")
-                if tid:
-                    meta = task_meta.get(tid, {})
-                    meta.update({"assigned_to": agent, "leased_at": task["leased_at"]})
-                    task_meta[tid] = meta
+            # lease this task
+            leased_total += 1
+            queue.pop(i)
+            tid = t["id"]
+            meta = task_meta.get(tid) or {}
+            meta["assigned_to"] = agent
+            meta["leased_at"] = _now()
+            task_meta[tid] = meta
+            _update_timeline()
+            return t
 
-                leased_total += 1
-                return JSONResponse(task, status_code=200)
-        await asyncio.sleep(0.02)
+        # nothing found: either sleep briefly or return empty
+        await asyncio.sleep(0.05)
 
+        if empty == 1:
+            # return {} instead of 204 for clients that want explicit "no task"
+            return {}
+
+    # timed out
     if empty == 1:
-        return JSONResponse({}, status_code=200)
+        return {}
     return Response(status_code=204)
 
-# --------------- Result ingest ---------------------
 @app.post("/result")
-def post_result(r: Dict[str, Any] = Body(...)):
+def store_result(payload: Dict[str, Any] = Body(...)):
     """
-    Accepts agent results (any superset). Normalizes and stores by task id.
+    Store result from an agent.
+    Expected payload (agent side):
+      {"id":..., "agent":..., "ok": bool, "duration_ms": int, "output":..., "error":..., "op":..., "trace":...}
     """
     global completed_total, failed_total
 
-    if "id" not in r or "agent" not in r:
-        raise HTTPException(status_code=422, detail="Result must include 'id' and 'agent'")
+    tid = str(payload.get("id") or "").strip()
+    if not tid:
+        raise HTTPException(status_code=422, detail="missing 'id'")
 
-    rid = str(r.get("id"))
-    meta = task_meta.get(rid, {})
-    op = meta.get("op", str(r.get("op", "")))  # tolerate agents echoing op
+    # Update main result record
+    rid = tid
+    ok_flag = bool(payload.get("ok"))
+    dur_ms = int(payload.get("duration_ms") or 0)
+    op = payload.get("op") or ""
 
-    trace = ""
-    if isinstance(op, str) and op.startswith("trace-"):
-        trace = op.split(".", 1)[0]
-
-    ok_flag = bool(r.get("ok", True))
-    dur_ms = int(r.get("duration_ms") or 0)
-
+    meta = task_meta.get(tid) or {}
     rec = {
         "id": rid,
-        "agent": r.get("agent"),
+        "task_id": tid,
+        "agent": payload.get("agent"),
         "ok": ok_flag,
-        "output": r.get("output"),
         "duration_ms": dur_ms,
-        "error": r.get("error") or "",
+        "output": payload.get("output"),
+        "error": payload.get("error"),
         "op": op,
-        "trace": trace,
-        "_raw": r,
-        "ts": _now(),
-        "assigned_to": meta.get("assigned_to"),
+        "trace": payload.get("trace") or "",
+        "ts": _now_s(),
         "leased_at": meta.get("leased_at"),
         "seed_ts": meta.get("seed_ts"),
         "requires": meta.get("requires"),
@@ -339,6 +307,46 @@ def post_result(r: Dict[str, Any] = Body(...)):
         jobs[job_id]["result_id"] = rid
 
     return {"stored": True, "id": rid}
+
+
+# --------------- Task normalization helper -------------------
+def _normalize_single_task(
+    op: str,
+    payload: Any,
+    given_id: Optional[str] = None,
+    requires: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize incoming tasks into the internal queue format.
+
+    Ensures:
+      - every task has an id
+      - we store op/payload/requires on the queue item
+      - task_meta is updated so metrics & jobs have consistent data
+    """
+    op = str(op or "").strip() or "sha256"
+    tid = given_id or _new_id()
+
+    t: Dict[str, Any] = {
+        "id": tid,
+        "op": op,
+        "payload": payload,
+    }
+    if requires:
+        t["requires"] = requires
+
+    meta = task_meta.get(tid) or {}
+    meta.update(
+        {
+            "id": tid,
+            "op": op,
+            "seed_ts": _now(),
+            "requires": requires,
+        }
+    )
+    task_meta[tid] = meta
+
+    return t
+
 
 # --------------- Seeding (compat & modern) ----------
 @app.post("/seed")
@@ -392,39 +400,35 @@ def submit_job(job: JobIn):
     job_id = _new_id()
     task = _normalize_single_task(job.type, job.payload, given_id=job_id, requires=job.requires)
     queue.append(task)
-    task_meta[job_id].update({"job_id": job_id})
-
     jobs[job_id] = {
         "id": job_id,
         "type": job.type,
-        "payload": job.payload,
-        "resources": job.resources,
-        "policy": job.policy,
-        "tenant": job.tenant,
-        "requires": job.requires,
         "status": "queued",
-        "queued_ts": _now(),
+        "requires": job.requires,
+        "created_at": _now(),
+        "result_id": None,
     }
-    return {"job_id": job_id, "status": "queued", "requires": job.requires}
+    return {"job_id": job_id, "status": "queued"}
 
-@app.get("/job/{job_id}")
-def job_status(job_id: str):
-    j = jobs.get(job_id)
-    if not j:
-        raise HTTPException(status_code=404, detail="job not found")
-    return j
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job_not_found")
+    res = None
+    if job.get("result_id"):
+        res = results.get(job["result_id"])
+    return {"job": job, "result": res}
 
-# --------------- Results dump ----------------------
 @app.get("/results")
-def all_results(
-    limit: int = Query(0, ge=0, description="If >0, return only the latest N results"),
-    agent: Optional[str] = Query(None),
-    op: Optional[str] = Query(None),
-    trace: Optional[str] = Query(None),
+def list_results(
+    agent: Optional[str] = None,
+    op: Optional[str] = None,
+    trace: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=1000),
 ):
     """
-    Returns stored results as a dict keyed by task id (back-compat).
-    Optional filters + limit.
+    Lightweight query over results for debugging.
     """
     items = list(results.values())
     if agent:
@@ -456,60 +460,37 @@ def stats():
         "leased_total": leased_total,
         "completed_total": completed_total,
         "failed_total": failed_total,
-        "rate_tasks_per_sec": {
-            "1s": round(rate_1s, 3),
-            "60s": round(rate_60s, 3),
-            "5m": round(rate_5m, 3),
-            "15m": round(rate_15m, 3),
-        }
+        "rate_1s": rate_1s,
+        "rate_60s": rate_60s,
+        "rate_5m": rate_5m,
+        "rate_15m": rate_15m,
+        "op_counts": dict(op_counts),
+        "op_avg_ms": {
+            op: (op_dur_sum_ms[op] / max(op_dur_n[op], 1)) for op in op_dur_sum_ms.keys()
+        },
     }
 
-@app.get("/stats/sparkline")
-def stats_sparkline(seconds: int = Query(60, ge=1, le=min(3600, RETENTION_SEC))):
-    """
-    Return per-second throughput for last N seconds as a list of {t, tps}.
-    Useful for UI charts. Light enough to poll every second.
-    """
-    if len(timeline) < 2:
-        return {"points": []}
+@app.get("/timeline")
+def get_timeline():
+    """Return the raw timeline for plotting."""
+    return list(timeline)
 
-    # Build tps from deltas of completed_total between consecutive seconds
-    end_ts = timeline[-1][0]
-    start_ts = end_ts - seconds + 1
-    # Convert timeline into dict for O(1) lookups per ts
-    by_ts = {ts: comp for ts, comp, _ in timeline}
-    points = []
-    prev_comp = None
-    for ts in range(start_ts, end_ts + 1):
-        comp = by_ts.get(ts, prev_comp if prev_comp is not None else 0)
-        if prev_comp is None:
-            tps = 0.0
-        else:
-            tps = max(0.0, comp - prev_comp)
-        points.append({"t": ts, "tps": tps})
-        prev_comp = comp
-    return {"points": points}
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok", "queue_len": len(queue), "results": len(results)}
 
-@app.get("/stats/ops")
-def stats_ops():
-    """Per-op counts and average duration in ms."""
-    data = {}
-    for op, cnt in op_counts.items():
-        n = max(1, op_dur_n.get(op, 0))
-        avg_ms = (op_dur_sum_ms.get(op, 0) / n) if op_dur_n.get(op, 0) else 0.0
-        data[op] = {"count": cnt, "avg_duration_ms": round(avg_ms, 2)}
-    return {"ops": data}
-
-# --------------- Maintenance -----------------------
+# --------------- Admin/debug --------------------
 @app.post("/purge")
-def purge(all: int = 0):
-    """
-    POST /purge       -> clear queue only
-    POST /purge?all=1 -> clear queue + results + meta + jobs (keeps agents)
-    Metrics timeline is retained (24h ring); counters are NOT reset unless all=1.
-    """
+def purge(
+    q: bool = Query(True, description="Clear the queue"),
+    r: bool = Query(False, description="Clear results"),
+    all: bool = Query(False, description="Clear queue+results+jobs+metrics+timeline"),
+):
     global completed_total, failed_total, leased_total
-    queue.clear()
+    if q:
+        queue.clear()
+    if r:
+        results.clear()
     if all:
         results.clear()
         task_meta.clear()
