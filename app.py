@@ -1,4 +1,4 @@
-# app.py — controller (GPU-aware agent registry + lightweight 24h metrics)
+# app.py — controller (GPU-aware agent registry + lightweight 24h metrics + worker-aware wiring v1)
 
 from fastapi import FastAPI, HTTPException, Body, Query, Response, Request
 from fastapi.responses import JSONResponse
@@ -27,8 +27,11 @@ op_counts: Dict[str, int] = defaultdict(int)
 op_dur_sum_ms: Dict[str, float] = defaultdict(float)
 op_dur_n: Dict[str, int] = defaultdict(int)
 
-# agent registry: {agent_id: {"labels": {...}, "capabilities": {...}, "last_seen": ts}}
+# agent registry: {agent_id: {"labels": {...}, "capabilities": {...}, "last_seen": ts, "workers": {...}}}
 agents: Dict[str, Dict[str, Any]] = {}
+
+# per-agent leases currently in flight (for worker sizing / utilization views)
+agent_inflight: Dict[str, int] = defaultdict(int)
 
 # ---------------- Helpers ----------------
 
@@ -140,6 +143,30 @@ def _meets_requires(agent_rec: Optional[Dict[str, Any]], requires: Optional[Dict
 
     return True
 
+def _merge_worker_info(rec: Dict[str, Any], payload: Dict[str, Any]) -> None:
+    """
+    Step 1 wiring for worker sizing:
+    - Accept either top-level 'max_workers' or nested 'workers': {'max': N}
+    - Store under rec['workers'] = {'max': int} for UI.
+    """
+    workers = rec.get("workers") or {}
+    # top-level shorthand
+    if "max_workers" in payload:
+        try:
+            workers["max"] = int(payload["max_workers"])
+        except Exception:
+            pass
+    # nested structure
+    if isinstance(payload.get("workers"), dict):
+        w = payload["workers"]
+        if "max" in w:
+            try:
+                workers["max"] = int(w["max"])
+            except Exception:
+                pass
+    if workers:
+        rec["workers"] = workers
+
 # --------------- Models (for ergonomics) ----------
 class SeedLegacy(BaseModel):
     # {"type":"sha256","count":5}
@@ -163,8 +190,15 @@ class JobIn(BaseModel):
 @app.post("/agents/register")
 def agents_register(payload: Dict[str, Any] = Body(...)):
     """
-    Register or upsert an agent with labels + capabilities.
-    payload: {"agent": "...", "labels": {...}, "capabilities": {...}, "timestamp": int}
+    Register or upsert an agent with labels + capabilities + optional worker sizing.
+    payload: {
+      "agent": "...",
+      "labels": {...},
+      "capabilities": {...},
+      "timestamp": int,
+      "max_workers": int,          # optional shorthand
+      "workers": {"max": int}      # optional structured form
+    }
     """
     agent_id = str(payload.get("agent") or "").strip()
     if not agent_id:
@@ -173,6 +207,7 @@ def agents_register(payload: Dict[str, Any] = Body(...)):
     rec["labels"] = payload.get("labels") or rec.get("labels") or {}
     rec["capabilities"] = payload.get("capabilities") or rec.get("capabilities") or {}
     rec["last_seen"] = _now()
+    _merge_worker_info(rec, payload)
     agents[agent_id] = rec
     return {"registered": True, "agent": agent_id}
 
@@ -180,6 +215,7 @@ def agents_register(payload: Dict[str, Any] = Body(...)):
 def agents_heartbeat(payload: Dict[str, Any] = Body(...)):
     """
     Lightweight upsert for periodic updates.
+    Allows refreshing labels/capabilities and worker sizing.
     """
     agent_id = str(payload.get("agent") or "").strip()
     if not agent_id:
@@ -190,14 +226,21 @@ def agents_heartbeat(payload: Dict[str, Any] = Body(...)):
     if isinstance(payload.get("capabilities"), dict):
         # replace to avoid stale nested keys
         rec["capabilities"] = payload["capabilities"]
+    _merge_worker_info(rec, payload)
     rec["last_seen"] = _now()
     agents[agent_id] = rec
     return {"heartbeat": True, "agent": agent_id}
 
 @app.get("/agents")
 def list_agents():
-    """Debug view of registered agents."""
-    return agents
+    """Debug view of registered agents, including per-agent inflight leases."""
+    out: Dict[str, Any] = {}
+    for aid, rec in agents.items():
+        # shallow copy so we don't mutate the in-memory record
+        view = dict(rec)
+        view["inflight"] = int(agent_inflight.get(aid, 0))
+        out[aid] = view
+    return out
 
 # --------------- Task leasing (simple, back-compat) ------------
 @app.get("/task")
@@ -212,8 +255,13 @@ async def get_task(
     If the agent advertises capabilities (X-Tasks or ?ops=...), lease only compatible ops.
     If the task has 'requires', also check agent registry to ensure constraints are met.
     Preference: unassigned, or already assigned to this agent (retries).
+
+    Worker wiring (step 1):
+    - We increment agent_inflight[agent] whenever we lease a task.
+    - Decrement happens in /result when that task is reported back.
+    - This does NOT enforce limits yet; it just feeds UI + future policies.
     """
-    global leased_total
+    global leased_total, agent_inflight
 
     ops_advertised = _parse_capabilities(request)  # None = accept anything (back-compat)
     deadline = _now() + (wait_ms / 1000.0)
@@ -239,6 +287,7 @@ async def get_task(
             meta["assigned_to"] = agent
             meta["leased_at"] = _now()
             task_meta[tid] = meta
+            agent_inflight[agent] = agent_inflight.get(agent, 0) + 1
             _update_timeline()
             return t
 
@@ -261,7 +310,7 @@ def store_result(payload: Dict[str, Any] = Body(...)):
     Expected payload (agent side):
       {"id":..., "agent":..., "ok": bool, "duration_ms": int, "output":..., "error":..., "op":..., "trace":...}
     """
-    global completed_total, failed_total
+    global completed_total, failed_total, agent_inflight
 
     tid = str(payload.get("id") or "").strip()
     if not tid:
@@ -272,12 +321,13 @@ def store_result(payload: Dict[str, Any] = Body(...)):
     ok_flag = bool(payload.get("ok"))
     dur_ms = int(payload.get("duration_ms") or 0)
     op = payload.get("op") or ""
+    agent_id = payload.get("agent")
 
     meta = task_meta.get(tid) or {}
     rec = {
         "id": rid,
         "task_id": tid,
-        "agent": payload.get("agent"),
+        "agent": agent_id,
         "ok": ok_flag,
         "duration_ms": dur_ms,
         "output": payload.get("output"),
@@ -305,6 +355,14 @@ def store_result(payload: Dict[str, Any] = Body(...)):
     if job_id and job_id in jobs:
         jobs[job_id]["status"] = "done"
         jobs[job_id]["result_id"] = rid
+
+    # decrement inflight for that agent, but don't let it go negative even if agent_id is weird
+    if isinstance(agent_id, str) and agent_id:
+        current = agent_inflight.get(agent_id, 0)
+        if current <= 1:
+            agent_inflight[agent_id] = 0
+        else:
+            agent_inflight[agent_id] = current - 1
 
     return {"stored": True, "id": rid}
 
@@ -446,7 +504,7 @@ def list_results(
 # --------------- Metrics endpoints -----------------
 @app.get("/stats")
 def stats():
-    """Snapshot plus rolling rates."""
+    """Snapshot plus rolling rates and per-agent inflight leases."""
     rate_1s = _rate_per_sec(1)
     rate_60s = _rate_per_sec(60)
     rate_5m = _rate_per_sec(300)
@@ -468,6 +526,8 @@ def stats():
         "op_avg_ms": {
             op: (op_dur_sum_ms[op] / max(op_dur_n[op], 1)) for op in op_dur_sum_ms.keys()
         },
+        # new: exposure for UI / capacity views
+        "agent_inflight": {k: int(v) for k, v in agent_inflight.items()},
     }
 
 @app.get("/timeline")
@@ -486,7 +546,7 @@ def purge(
     r: bool = Query(False, description="Clear results"),
     all: bool = Query(False, description="Clear queue+results+jobs+metrics+timeline"),
 ):
-    global completed_total, failed_total, leased_total
+    global completed_total, failed_total, leased_total, agent_inflight
     if q:
         queue.clear()
     if r:
@@ -504,4 +564,5 @@ def purge(
         op_counts.clear()
         op_dur_sum_ms.clear()
         op_dur_n.clear()
+        agent_inflight = defaultdict(int)
     return {"purged": True, "all": bool(all), "queue_len": len(queue)}
