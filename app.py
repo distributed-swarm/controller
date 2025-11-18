@@ -1,4 +1,4 @@
-# controller app.py – stable reset
+# controller app.py – stable reset 
 # FastAPI controller for swarm: agents, tasks, jobs, stats.
 
 from fastapi import FastAPI, HTTPException, Query
