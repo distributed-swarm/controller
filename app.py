@@ -146,9 +146,7 @@ def list_agents() -> Dict[str, Any]:
 # Task leasing
 # -----------------------------------------------------------------------------
 
-@app.get(
-    "/task",
-)
+@app.get("/task")
 @app.get(
     "/api/task",
     summary="Agent polls for next task",
@@ -443,7 +441,7 @@ def stats_ops() -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# Seeding / purge
+# Seeding / purge / stress
 # -----------------------------------------------------------------------------
 
 @app.post("/seed")
@@ -451,6 +449,13 @@ def stats_ops() -> Dict[str, Any]:
 async def seed(request: Request) -> Dict[str, Any]:
     """
     Seed some demo jobs, mostly for your brutal smoke tests.
+
+    Body:
+      {
+        "count": 10,
+        "op": "map_tokenize",
+        "payload_template": {...}
+      }
     """
     payload = await request.json()
     count = int(payload.get("count", 10))
@@ -459,7 +464,7 @@ async def seed(request: Request) -> Dict[str, Any]:
         "text": "The quick brown fox jumps over the lazy dog."
     }
 
-    job_ids = []
+    job_ids: List[str] = []
     with STATE_LOCK:
         for _ in range(count):
             # naive template expansion
@@ -468,6 +473,56 @@ async def seed(request: Request) -> Dict[str, Any]:
             job_ids.append(_enqueue_job(op, body))
 
     return {"status": "ok", "count": count, "op": op, "job_ids": job_ids}
+
+
+@app.post("/stress")
+@app.post("/api/stress")
+async def stress(request: Request) -> Dict[str, Any]:
+    """
+    Create a heavier batch of jobs for stress testing the swarm.
+
+    Body:
+      {
+        "total_tasks": 100,          # alias: "count"
+        "batch_size": 10,            # advisory, not enforced here
+        "concurrency": 4,            # advisory; real concurrency comes from agents
+        "op": "map_tokenize",
+        "payload_template": {...}
+      }
+
+    This currently just enqueues `total_tasks` jobs, similar to /seed,
+    but keeps extra fields so your PS scripts / UI can reason about the
+    intended load pattern.
+    """
+    payload = await request.json()
+
+    total_tasks = int(
+        payload.get("total_tasks")
+        or payload.get("count")
+        or 10
+    )
+    batch_size = int(payload.get("batch_size") or total_tasks)
+    concurrency = int(payload.get("concurrency") or 1)
+    op = payload.get("op", "map_tokenize")
+    template = payload.get("payload_template") or {
+        "text": "The quick brown fox jumps over the lazy dog."
+    }
+
+    job_ids: List[str] = []
+    with STATE_LOCK:
+        for _ in range(total_tasks):
+            body = dict(template)
+            body["ts"] = _now()
+            job_ids.append(_enqueue_job(op, body))
+
+    return {
+        "status": "ok",
+        "total_tasks": total_tasks,
+        "batch_size": batch_size,
+        "concurrency": concurrency,
+        "op": op,
+        "job_ids": job_ids,
+    }
 
 
 @app.post("/purge")
