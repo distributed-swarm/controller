@@ -15,66 +15,182 @@ app = FastAPI(title="Distributed Swarm Controller")
 
 STATE_LOCK = threading.Lock()
 
-# agent_name -> {labels, capabilities, last_seen}
 AGENTS: Dict[str, Dict[str, Any]] = {}
-
-# job_id -> job dict
 JOBS: Dict[str, Dict[str, Any]] = {}
-
-# FIFO queue of job_ids waiting to be leased
 TASK_QUEUE: Deque[str] = deque()
 
-# counters
 LEASED_TOTAL = 0
 COMPLETED_TOTAL = 0
 FAILED_TOTAL = 0
 
-# timestamps of completed jobs (epoch seconds) for rate & sparkline
-COMPLETION_TIMES: Deque[float] = deque()
-
-# per-op stats: op -> {"count": int, "total_duration_ms": float}
-OP_STATS: Dict[str, Dict[str, float]] = defaultdict(
-    lambda: {"count": 0, "total_duration_ms": 0.0}
-)
-
-# how long we care about completion timestamps (seconds)
-MAX_COMPLETION_WINDOW_S = 15 * 60  # 15 minutes
+COMPLETION_TIMES: List[float] = []
+OP_COUNTS: Dict[str, int] = defaultdict(int)
+OP_TOTAL_MS: Dict[str, float] = defaultdict(float)
 
 
 def _now() -> float:
     return time.time()
 
 
-def _prune_completion_times(now: Optional[float] = None) -> None:
-    """Keep COMPLETION_TIMES within MAX_COMPLETION_WINDOW_S."""
+def _prune_completion_times(now: Optional[float] = None, window_s: float = 900.0) -> None:
+    """
+    Keep only completions in the last `window_s` seconds (default 15m).
+    """
     if now is None:
         now = _now()
-    cutoff = now - MAX_COMPLETION_WINDOW_S
-    while COMPLETION_TIMES and COMPLETION_TIMES[0] < cutoff:
-        COMPLETION_TIMES.popleft()
 
-
-def _calc_rate(window_s: float, now: Optional[float] = None) -> float:
-    """Tasks/sec over the last window_s seconds."""
-    if window_s <= 0:
-        return 0.0
-    if now is None:
-        now = _now()
     cutoff = now - window_s
-    _prune_completion_times(now)
-    count = sum(1 for t in COMPLETION_TIMES if t >= cutoff)
-    return count / window_s if count > 0 else 0.0
+    i = 0
+    while i < len(COMPLETION_TIMES) and COMPLETION_TIMES[i] < cutoff:
+        i += 1
+    if i > 0:
+        del COMPLETION_TIMES[:i]
+
+
+# -----------------------------------------------------------------------------
+# Health
+# -----------------------------------------------------------------------------
+
+@app.get("/healthz", response_class=PlainTextResponse)
+def healthz() -> str:
+    """
+    Simple health check used by Docker/Portainer and UI.
+    """
+    with STATE_LOCK:
+        queue_len = len(TASK_QUEUE)
+        agents_online = len(AGENTS)
+    return PlainTextResponse(
+        f"ok queue={queue_len} agents={agents_online}",
+        media_type="text/plain",
+    )
+
+
+# -----------------------------------------------------------------------------
+# Agents
+# -----------------------------------------------------------------------------
+
+@app.post("/agents/register")
+@app.post("/api/agents/register")
+async def register_agent(request: Request) -> Dict[str, Any]:
+    """
+    Register an agent.
+
+    Accepts either:
+      {"agent": "name", "labels": {...}, "capabilities": {...}}
+    or:
+      {"name": "name", ...}
+    """
+    payload = await request.json()
+    name = payload.get("agent") or payload.get("name")
+    if not name:
+        raise HTTPException(status_code=400, detail="Missing 'agent' or 'name'")
+
+    labels = payload.get("labels") or {}
+    capabilities = payload.get("capabilities") or {}
+    now = _now()
+
+    with STATE_LOCK:
+        AGENTS[name] = {
+            "labels": labels,
+            "capabilities": capabilities,
+            "last_seen": now,
+        }
+
+    return {"status": "ok", "agent": name}
+
+
+@app.post("/agents/heartbeat")
+@app.post("/api/agents/heartbeat")
+async def agent_heartbeat(request: Request) -> Dict[str, Any]:
+    """
+    Agent heartbeat. Same shape as register.
+
+    Controllers in the wild already use this heavily, so keep it forgiving.
+    """
+    payload = await request.json()
+    name = payload.get("agent") or payload.get("name")
+    if not name:
+        raise HTTPException(status_code=400, detail="Missing 'agent' or 'name'")
+
+    labels = payload.get("labels") or {}
+    capabilities = payload.get("capabilities") or {}
+    now = _now()
+
+    with STATE_LOCK:
+        entry = AGENTS.get(name, {})
+        entry.setdefault("labels", {}).update(labels)
+        entry.setdefault("capabilities", {}).update(capabilities)
+        entry["last_seen"] = now
+        AGENTS[name] = entry
+
+    return {"status": "ok", "agent": name, "time": now}
+
+
+@app.get("/agents")
+@app.get("/api/agents")
+def list_agents() -> Dict[str, Any]:
+    """Return agents in the shape the UI & your PS script expect."""
+    with STATE_LOCK:
+        # shallow copy so we don't leak internal refs
+        return {
+            name: {
+                "labels": dict(info.get("labels") or {}),
+                "capabilities": dict(info.get("capabilities") or {}),
+                "last_seen": info.get("last_seen"),
+            }
+            for name, info in AGENTS.items()
+        }
+
+
+# -----------------------------------------------------------------------------
+# Task leasing
+# -----------------------------------------------------------------------------
+
+@app.get(
+    "/task",
+)
+@app.get(
+    "/api/task",
+    summary="Agent polls for next task",
+)
+def get_task(agent: str, wait_ms: int = 0):
+    """
+    GET /task?agent=agent-1&wait_ms=1000
+
+    Returns:
+      200 + JSON task if available
+      204 if none available before wait_ms
+    """
+    deadline = _now() + (wait_ms / 1000.0)
+
+    # Simple long-poll loop
+    while True:
+        with STATE_LOCK:
+            task = _lease_next_job(agent)
+
+        if task is not None:
+            return JSONResponse(task)
+
+        if _now() >= deadline:
+            # nothing to do
+            return JSONResponse(status_code=204, content=None)
+
+        # brief sleep to avoid hot-spinning the CPU
+        time.sleep(0.05)
 
 
 def _enqueue_job(op: str, payload: Dict[str, Any]) -> str:
+    """
+    Enqueue a job and return its ID.
+    """
     global JOBS, TASK_QUEUE
+
     job_id = str(uuid.uuid4())
-    now = _now()
     job = {
         "id": job_id,
         "op": op,
         "payload": payload,
-        "created_ts": now,
+        "created_ts": _now(),
         "leased_ts": None,
         "leased_by": None,
         "lease_timeout_s": 300,
@@ -108,141 +224,18 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
         job["leased_by"] = agent
         job["leased_ts"] = now
         LEASED_TOTAL += 1
-
         return {
-            "id": job["id"],
-            "type": job["op"],
+            "id": job_id,
+            "op": job["op"],
             "payload": job["payload"],
-            "timeout_ms": job["lease_timeout_s"] * 1000,
         }
 
+    # no jobs
     return None
 
 
-# -----------------------------------------------------------------------------
-# Health
-# -----------------------------------------------------------------------------
-
-@app.get("/healthz", response_class=PlainTextResponse)
-def healthz() -> PlainTextResponse:
-    """Simple health check for Docker / UI."""
-    with STATE_LOCK:
-        queue_len = len(TASK_QUEUE)
-        agents_online = len(AGENTS)
-    return PlainTextResponse(
-        f"ok queue={queue_len} agents={agents_online}",
-        media_type="text/plain",
-    )
-
-
-# -----------------------------------------------------------------------------
-# Agents
-# -----------------------------------------------------------------------------
-
-@app.post("/agents/register")
-async def register_agent(request: Request) -> Dict[str, Any]:
-    """
-    Register an agent.
-
-    Accepts either:
-      {"agent": "name", "labels": {...}, "capabilities": {...}}
-    or:
-      {"name": "name", ...}
-    """
-    payload = await request.json()
-    name = payload.get("agent") or payload.get("name")
-    if not name:
-        raise HTTPException(status_code=400, detail="Missing 'agent' or 'name'")
-
-    labels = payload.get("labels") or {}
-    capabilities = payload.get("capabilities") or {}
-    now = _now()
-
-    with STATE_LOCK:
-        AGENTS[name] = {
-            "labels": labels,
-            "capabilities": capabilities,
-            "last_seen": now,
-        }
-
-    return {"status": "ok", "agent": name}
-
-
-@app.post("/agents/heartbeat")
-async def agent_heartbeat(request: Request) -> Dict[str, Any]:
-    """
-    Agent heartbeat. Same shape as register.
-
-    Controllers in the wild already use this heavily, so keep it forgiving.
-    """
-    payload = await request.json()
-    name = payload.get("agent") or payload.get("name")
-    if not name:
-        raise HTTPException(status_code=400, detail="Missing 'agent' or 'name'")
-
-    labels = payload.get("labels") or {}
-    capabilities = payload.get("capabilities") or {}
-    now = _now()
-
-    with STATE_LOCK:
-        entry = AGENTS.get(name, {})
-        entry.setdefault("labels", {}).update(labels)
-        entry.setdefault("capabilities", {}).update(capabilities)
-        entry["last_seen"] = now
-        AGENTS[name] = entry
-
-    return {"status": "ok", "agent": name, "time": now}
-
-
-@app.get("/agents")
-def list_agents() -> Dict[str, Any]:
-    """Return agents in the shape the UI & your PS script expect."""
-    with STATE_LOCK:
-        # shallow copy so we don't leak internal refs
-        return {
-            name: {
-                "labels": dict(info.get("labels") or {}),
-                "capabilities": dict(info.get("capabilities") or {}),
-                "last_seen": info.get("last_seen"),
-            }
-            for name, info in AGENTS.items()
-        }
-
-
-# -----------------------------------------------------------------------------
-# Task leasing
-# -----------------------------------------------------------------------------
-
-@app.get(
-    "/task",
-    summary="Agent polls for next task",
-)
-def get_task(agent: str, wait_ms: int = 0):
-    """
-    GET /task?agent=agent-1&wait_ms=1000
-
-    Returns:
-      200 + JSON task if available
-      204 if none available before wait_ms
-    """
-    deadline = _now() + (wait_ms / 1000.0)
-
-    while True:
-        with STATE_LOCK:
-            task = _lease_next_job(agent)
-
-        if task is not None:
-            return JSONResponse(task)
-
-        if _now() >= deadline:
-            # nothing to do
-            return JSONResponse(status_code=204, content=None)
-
-        # brief sleep to avoid hot-spinning the CPU
-        time.sleep(0.05)
-
-
 @app.post("/result")
+@app.post("/api/result")
 async def post_result(request: Request) -> Dict[str, Any]:
     """
     Agent posts result:
@@ -291,20 +284,18 @@ async def post_result(request: Request) -> Dict[str, Any]:
 
         # completion timeline (throughput & sparkline)
         COMPLETION_TIMES.append(now)
-        _prune_completion_times(now)
 
-        # op stats
+        # op-level stats
         op = job.get("op") or payload.get("op") or "unknown"
-        stat = OP_STATS[op]
-        stat["count"] += 1
+        OP_COUNTS[op] += 1
         if duration_ms is not None:
-            stat["total_duration_ms"] += float(duration_ms)
+            OP_TOTAL_MS[op] += float(duration_ms)
 
     return {"status": "ok", "id": job_id}
 
 
 # -----------------------------------------------------------------------------
-# Jobs & results inspection
+# Jobs / results inspection
 # -----------------------------------------------------------------------------
 
 @app.get("/jobs/{job_id}")
@@ -331,21 +322,33 @@ def list_results(limit: int = 100) -> List[Dict[str, Any]]:
 
 @app.get("/timeline")
 def timeline(limit: int = 200) -> List[Dict[str, Any]]:
-    """Simple job timeline ordered by creation time."""
+    """Timeline of jobs by created_ts."""
     with STATE_LOCK:
-        items = list(JOBS.values())
-        items.sort(key=lambda j: j.get("created_ts") or 0.0, reverse=True)
-        return items[:limit]
+        jobs = list(JOBS.values())
+        jobs.sort(key=lambda j: j.get("created_ts") or 0.0)
+        return jobs[-limit:]
 
 
 # -----------------------------------------------------------------------------
-# Stats & metrics (used by ds-ui)
+# Stats / metrics for UI
 # -----------------------------------------------------------------------------
+
+def _calc_rate(window_s: float, now: Optional[float] = None) -> float:
+    """Tasks/sec over the last window_s seconds."""
+    if window_s <= 0:
+        return 0.0
+    if now is None:
+        now = _now()
+    cutoff = now - window_s
+    _prune_completion_times(now)
+    count = sum(1 for t in COMPLETION_TIMES if t >= cutoff)
+    return count / window_s if count > 0 else 0.0
+
 
 @app.get("/stats")
 def stats() -> Dict[str, Any]:
     """
-    Aggregate stats.
+    Summary stats for the UI.
 
     Shape matches what your PowerShell output showed:
       time, agents_online, queue_len, leased_total,
@@ -361,21 +364,20 @@ def stats() -> Dict[str, Any]:
         failed_total = FAILED_TOTAL
 
         _prune_completion_times(now)
-        rate_1s = _calc_rate(1, now)
-        rate_60s = _calc_rate(60, now)
-        rate_5m = _calc_rate(5 * 60, now)
-        rate_15m = _calc_rate(15 * 60, now)
 
-        op_counts = {op: int(stat["count"]) for op, stat in OP_STATS.items()}
+        rate_1s = _calc_rate(1.0, now)
+        rate_60s = _calc_rate(60.0, now)
+        rate_5m = _calc_rate(300.0, now)
+        rate_15m = _calc_rate(900.0, now)
+
+        op_counts = dict(OP_COUNTS)
         op_avg_ms = {
-            op: (stat["total_duration_ms"] / stat["count"])
-            if stat["count"] > 0
-            else 0.0
-            for op, stat in OP_STATS.items()
+            op: (OP_TOTAL_MS[op] / count) if count > 0 else 0.0
+            for op, count in OP_COUNTS.items()
         }
 
     return {
-        "time": int(now),
+        "time": now,
         "agents_online": agents_online,
         "queue_len": queue_len,
         "leased_total": leased_total,
@@ -391,113 +393,90 @@ def stats() -> Dict[str, Any]:
 
 
 @app.get("/stats/sparkline")
-def stats_sparkline(seconds: int = 60) -> Dict[str, Any]:
+def stats_sparkline() -> Dict[str, Any]:
     """
-    Throughput sparkline for the UI.
-
-    Returns:
-      {
-        "window_s": 60,
-        "points": [
-          {"t": <unix>, "tps": <float>}, ...
-        ]
-      }
+    Tiny sparkline-friendly throughput series over the last 15 minutes.
     """
-    if seconds <= 0:
-        seconds = 60
-
     now = _now()
-    start = now - seconds
+    window_s = 900.0
+    bucket_s = 10.0
 
     with STATE_LOCK:
-        _prune_completion_times(now)
-        # copy timestamps to avoid holding lock while doing O(n * window) work
-        timestamps = list(COMPLETION_TIMES)
+        _prune_completion_times(now, window_s)
+        times = list(COMPLETION_TIMES)
 
-    # bucket into 1s intervals
-    points: List[Dict[str, float]] = []
-    for i in range(seconds):
-        bucket_start = start + i
-        bucket_end = bucket_start + 1.0
-        count = sum(
-            1 for t in timestamps if bucket_start <= t < bucket_end
-        )
-        points.append({"t": bucket_start, "tps": float(count)})
+    if not times:
+        return {"buckets": [], "values": []}
 
-    return {"window_s": seconds, "points": points}
+    start = now - window_s
+    num_buckets = int(window_s / bucket_s)
+    buckets = [start + i * bucket_s for i in range(num_buckets)]
+    counts = [0] * num_buckets
+
+    for t in times:
+        idx = int((t - start) / bucket_s)
+        if 0 <= idx < num_buckets:
+            counts[idx] += 1
+
+    return {
+        "buckets": buckets,
+        "values": counts,
+    }
 
 
 @app.get("/stats/ops")
 def stats_ops() -> Dict[str, Any]:
     """
-    Per-op metrics for the table in the dashboard.
-
-    {
-      "ops": {
-        "map_tokenize": {
-          "count": 123,
-          "avg_duration_ms": 45.67
-        },
-        ...
-      }
-    }
+    Per-op stats for the UI: counts and average ms.
     """
     with STATE_LOCK:
-        ops = {
-            op: {
-                "count": int(stat["count"]),
-                "avg_duration_ms": (
-                    stat["total_duration_ms"] / stat["count"]
-                    if stat["count"] > 0
-                    else 0.0
-                ),
-            }
-            for op, stat in OP_STATS.items()
+        op_counts = dict(OP_COUNTS)
+        op_avg_ms = {
+            op: (OP_TOTAL_MS[op] / count) if count > 0 else 0.0
+            for op, count in OP_COUNTS.items()
         }
-    return {"ops": ops}
+
+    return {
+        "op_counts": op_counts,
+        "op_avg_ms": op_avg_ms,
+    }
 
 
 # -----------------------------------------------------------------------------
-# Seeding & admin
+# Seeding / purge
 # -----------------------------------------------------------------------------
 
 @app.post("/seed")
 @app.post("/api/seed")  # extra compatibility; nginx usually strips /api
-async def seed_job(request: Request) -> Dict[str, Any]:
+async def seed(request: Request) -> Dict[str, Any]:
     """
-    Enqueue a job.
-
-    Accepts either:
-      JSON: { "type": "map_tokenize", "payload": { ... } }
-    or query params: /seed?type=map_tokenize&text=smoke+test
+    Seed some demo jobs, mostly for your brutal smoke tests.
     """
-    if request.headers.get("content-type", "").startswith(
-        "application/json"
-    ):
-        body = await request.json()
-        op = body.get("type")
-        payload = body.get("payload") or {}
-    else:
-        # fall back to query params
-        qp = dict(request.query_params)
-        op = qp.get("type")
-        payload = {k: v for k, v in qp.items() if k != "type"}
+    payload = await request.json()
+    count = int(payload.get("count", 10))
+    op = payload.get("op", "map_tokenize")
+    template = payload.get("payload_template") or {
+        "text": "The quick brown fox jumps over the lazy dog."
+    }
 
-    if not op:
-        raise HTTPException(status_code=400, detail="Missing 'type'")
-
+    job_ids = []
     with STATE_LOCK:
-        job_id = _enqueue_job(op, payload)
+        for _ in range(count):
+            # naive template expansion
+            body = dict(template)
+            body["ts"] = _now()
+            job_ids.append(_enqueue_job(op, body))
 
-    # Keep response shape similar to what your PS table showed
-    return {"queued": 0, "op": op, "requires": None, "job_id": job_id}
+    return {"status": "ok", "count": count, "op": op, "job_ids": job_ids}
 
 
 @app.post("/purge")
 def purge() -> Dict[str, Any]:
-    """Brutal reset. Nukes jobs & stats, keeps agents."""
+    """
+    Blow away all jobs and reset counters. Useful when you want a clean run.
+    """
     global JOBS, TASK_QUEUE, LEASED_TOTAL, COMPLETED_TOTAL, FAILED_TOTAL
-    global COMPLETION_TIMES, OP_STATS
+    global COMPLETION_TIMES, OP_COUNTS, OP_TOTAL_MS
 
     with STATE_LOCK:
         JOBS = {}
@@ -505,19 +484,8 @@ def purge() -> Dict[str, Any]:
         LEASED_TOTAL = 0
         COMPLETED_TOTAL = 0
         FAILED_TOTAL = 0
-        COMPLETION_TIMES = deque()
-        OP_STATS = defaultdict(
-            lambda: {"count": 0, "total_duration_ms": 0.0}
-        )
+        COMPLETION_TIMES = []
+        OP_COUNTS = defaultdict(int)
+        OP_TOTAL_MS = defaultdict(float)
 
-    return {"status": "ok", "purged": True}
-
-
-# -----------------------------------------------------------------------------
-# Local dev entrypoint (container uses uvicorn app:app)
-# -----------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run("app:app", host="0.0.0.0", port=8080, reload=True)
+    return {"status": "ok", "message": "purged"}
