@@ -27,6 +27,9 @@ COMPLETION_TIMES: List[float] = []
 OP_COUNTS: Dict[str, int] = defaultdict(int)
 OP_TOTAL_MS: Dict[str, float] = defaultdict(float)
 
+# Track stress runs so you can see what you've launched
+STRESS_RUNS: Dict[str, Dict[str, Any]] = {}
+
 
 def _now() -> float:
     return time.time()
@@ -448,14 +451,19 @@ def stats_ops() -> Dict[str, Any]:
 @app.post("/api/seed")  # extra compatibility; nginx usually strips /api
 async def seed(request: Request) -> Dict[str, Any]:
     """
-    Seed some demo jobs, mostly for your brutal smoke tests.
+    Seed some demo jobs, mostly for your smaller smoke tests.
 
-    Body:
+    Body shape (new style):
       {
-        "count": 10,
+        "count": 50,
         "op": "map_tokenize",
-        "payload_template": {...}
+        "payload_template": { ... }
       }
+
+    If omitted:
+      - count defaults to 10
+      - op defaults to "map_tokenize"
+      - payload_template defaults to a simple fox sentence
     """
     payload = await request.json()
     count = int(payload.get("count", 10))
@@ -464,10 +472,9 @@ async def seed(request: Request) -> Dict[str, Any]:
         "text": "The quick brown fox jumps over the lazy dog."
     }
 
-    job_ids: List[str] = []
+    job_ids = []
     with STATE_LOCK:
         for _ in range(count):
-            # naive template expansion
             body = dict(template)
             body["ts"] = _now()
             job_ids.append(_enqueue_job(op, body))
@@ -475,54 +482,191 @@ async def seed(request: Request) -> Dict[str, Any]:
     return {"status": "ok", "count": count, "op": op, "job_ids": job_ids}
 
 
+def _stress_worker(
+    stress_id: str,
+    op: str,
+    template: Dict[str, Any],
+    total: int,
+    concurrency: int,
+    batch_delay_ms: int,
+) -> None:
+    """
+    Background worker that enqueues jobs in batches to simulate
+    controllable load and concurrency.
+    """
+    remaining = max(int(total), 0)
+    concurrency = max(int(concurrency), 1)
+    delay_s = max(batch_delay_ms, 0) / 1000.0
+
+    with STATE_LOCK:
+        run = STRESS_RUNS.get(stress_id)
+        if run is None:
+            return
+        run["status"] = "running"
+
+    while remaining > 0:
+        batch = min(concurrency, remaining)
+        job_ids: List[str] = []
+
+        with STATE_LOCK:
+            for _ in range(batch):
+                body = dict(template)
+                body["ts"] = _now()
+                body["stress_id"] = stress_id
+                job_ids.append(_enqueue_job(op, body))
+
+            run = STRESS_RUNS.get(stress_id)
+            if run is not None:
+                run["enqueued"] += batch
+                run.setdefault("job_ids", [])
+                # Don't let this list explode; keep it sampled
+                if len(run["job_ids"]) < 1000:
+                    run["job_ids"].extend(job_ids)
+
+        remaining -= batch
+        if remaining <= 0:
+            break
+        if delay_s > 0:
+            time.sleep(delay_s)
+
+    with STATE_LOCK:
+        run = STRESS_RUNS.get(stress_id)
+        if run is not None:
+            run["status"] = "completed"
+            run["completed_ts"] = _now()
+
+
 @app.post("/stress")
 @app.post("/api/stress")
 async def stress(request: Request) -> Dict[str, Any]:
     """
-    Create a heavier batch of jobs for stress testing the swarm.
+    High-load / stress endpoint.
 
-    Body:
+    Supports BOTH shapes:
+
+    Legacy style (what you've been using):
       {
-        "total_tasks": 100,          # alias: "count"
-        "batch_size": 10,            # advisory, not enforced here
-        "concurrency": 4,            # advisory; real concurrency comes from agents
-        "op": "map_tokenize",
-        "payload_template": {...}
+        "type": "map_tokenize",
+        "payload": { ... },
+        "repeat": 200,
+        "concurrency": 10,
+        "batch_delay_ms": 250
       }
 
-    This currently just enqueues `total_tasks` jobs, similar to /seed,
-    but keeps extra fields so your PS scripts / UI can reason about the
-    intended load pattern.
-    """
-    payload = await request.json()
+    New explicit style:
+      {
+        "op": "map_tokenize",
+        "payload_template": { ... },
+        "total": 200,
+        "concurrency": 10,
+        "batch_delay_ms": 250
+      }
 
-    total_tasks = int(
-        payload.get("total_tasks")
-        or payload.get("count")
-        or 10
-    )
-    batch_size = int(payload.get("batch_size") or total_tasks)
-    concurrency = int(payload.get("concurrency") or 1)
-    op = payload.get("op", "map_tokenize")
-    template = payload.get("payload_template") or {
+    Behavior:
+      - Enqueues `total` jobs in the background.
+      - Jobs are enqueued in batches of size `concurrency`.
+      - Wait `batch_delay_ms` between batches.
+      - Real concurrency is still governed by how many agents & workers you have,
+        but this lets you control how hard and how fast you push the queue.
+
+    Returns:
+      {
+        "status": "started",
+        "stress_id": "<uuid>",
+        "op": "...",
+        "total": ...,
+        "concurrency": ...,
+        "batch_delay_ms": ...
+      }
+    """
+    body = await request.json()
+
+    # Resolve op
+    op = body.get("op") or body.get("type") or "map_tokenize"
+
+    # Resolve template
+    template = body.get("payload_template") or body.get("payload") or {
         "text": "The quick brown fox jumps over the lazy dog."
     }
 
-    job_ids: List[str] = []
+    # Resolve total jobs
+    total = body.get("total")
+    if total is None:
+        total = body.get("count")
+    if total is None:
+        total = body.get("repeat")
+    if total is None:
+        total = 100
+    total = int(total)
+
+    # Concurrency & batch timing
+    concurrency = int(body.get("concurrency", 10))
+    batch_delay_ms = int(body.get("batch_delay_ms", 250))
+
+    stress_id = str(uuid.uuid4())
+    now = _now()
+
     with STATE_LOCK:
-        for _ in range(total_tasks):
-            body = dict(template)
-            body["ts"] = _now()
-            job_ids.append(_enqueue_job(op, body))
+        STRESS_RUNS[stress_id] = {
+            "id": stress_id,
+            "created_ts": now,
+            "status": "pending",
+            "op": op,
+            "total": total,
+            "concurrency": concurrency,
+            "batch_delay_ms": batch_delay_ms,
+            "payload_template": dict(template),
+            "enqueued": 0,
+            "job_ids": [],
+        }
+
+    t = threading.Thread(
+        target=_stress_worker,
+        args=(stress_id, op, dict(template), total, concurrency, batch_delay_ms),
+        daemon=True,
+    )
+    t.start()
 
     return {
-        "status": "ok",
-        "total_tasks": total_tasks,
-        "batch_size": batch_size,
-        "concurrency": concurrency,
+        "status": "started",
+        "stress_id": stress_id,
         "op": op,
-        "job_ids": job_ids,
+        "total": total,
+        "concurrency": concurrency,
+        "batch_delay_ms": batch_delay_ms,
     }
+
+
+@app.get("/stress")
+def list_stress_runs() -> List[Dict[str, Any]]:
+    """
+    List recent stress runs and their high-level status.
+    """
+    with STATE_LOCK:
+        runs = list(STRESS_RUNS.values())
+        runs.sort(key=lambda r: r.get("created_ts") or 0.0, reverse=True)
+        # Don't dump giant job_ids arrays every time
+        slimmed: List[Dict[str, Any]] = []
+        for r in runs:
+            r_copy = dict(r)
+            if "job_ids" in r_copy:
+                r_copy["job_ids_count"] = len(r_copy["job_ids"])
+                # hide the actual list in the listing view
+                r_copy.pop("job_ids", None)
+            slimmed.append(r_copy)
+        return slimmed
+
+
+@app.get("/stress/{stress_id}")
+def get_stress_run(stress_id: str) -> Dict[str, Any]:
+    """
+    Inspect a specific stress run by ID.
+    """
+    with STATE_LOCK:
+        run = STRESS_RUNS.get(stress_id)
+        if not run:
+            raise HTTPException(status_code=404, detail="Unknown stress_id")
+        return run
 
 
 @app.post("/purge")
@@ -531,7 +675,7 @@ def purge() -> Dict[str, Any]:
     Blow away all jobs and reset counters. Useful when you want a clean run.
     """
     global JOBS, TASK_QUEUE, LEASED_TOTAL, COMPLETED_TOTAL, FAILED_TOTAL
-    global COMPLETION_TIMES, OP_COUNTS, OP_TOTAL_MS
+    global COMPLETION_TIMES, OP_COUNTS, OP_TOTAL_MS, STRESS_RUNS
 
     with STATE_LOCK:
         JOBS = {}
@@ -542,5 +686,6 @@ def purge() -> Dict[str, Any]:
         COMPLETION_TIMES = []
         OP_COUNTS = defaultdict(int)
         OP_TOTAL_MS = defaultdict(float)
+        STRESS_RUNS = {}
 
     return {"status": "ok", "message": "purged"}
