@@ -27,8 +27,28 @@ COMPLETION_TIMES: List[float] = []
 OP_COUNTS: Dict[str, int] = defaultdict(int)
 OP_TOTAL_MS: Dict[str, float] = defaultdict(float)
 
-# Track stress runs so you can see what you've launched
-STRESS_RUNS: Dict[str, Dict[str, Any]] = {}
+# -----------------------------------------------------------------------------
+# Agent health / autonomic thresholds
+# -----------------------------------------------------------------------------
+
+# How long an agent can go without a heartbeat before we call it "dead"
+DEAD_AGENT_THRESHOLD_S = 60.0
+
+# Latency / error thresholds for degraded / suspect classification
+DEGRADED_LATENCY_MS = 500.0       # above this, we start to worry
+DEGRADED_ERROR_RATE = 0.10        # >10% failures → degraded (if enough samples)
+SUSPECT_ERROR_RATE = 0.50         # >50% failures with enough volume → suspect
+SUSPECT_MIN_TASKS = 5             # only call it suspect if it's actually done work
+
+# Metrics we accept from agents in heartbeat/register payloads
+AGENT_METRIC_KEYS = [
+    "cpu_util",        # float 0..1
+    "ram_mb",          # float or int
+    "tasks_completed", # cumulative
+    "tasks_failed",    # cumulative
+    "avg_task_ms",     # moving average duration
+    "latency_ms",      # observed round-trip latency
+]
 
 
 def _now() -> float:
@@ -50,6 +70,74 @@ def _prune_completion_times(now: Optional[float] = None, window_s: float = 900.0
         del COMPLETION_TIMES[:i]
 
 
+def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> (str, str):
+    """
+    Compute a coarse health state for an agent based on last_seen + metrics.
+
+    Returns:
+      (state, reason)
+      state ∈ {"healthy", "degraded", "suspect", "dead", "unknown"}
+    """
+    if now is None:
+        now = _now()
+
+    last_seen = info.get("last_seen")
+    if last_seen is None:
+        return "unknown", "no_heartbeat_yet"
+
+    # Dead: missed heartbeat for too long
+    if now - float(last_seen) > DEAD_AGENT_THRESHOLD_S:
+        return "dead", "missed_heartbeat"
+
+    metrics = info.get("metrics") or {}
+    latency_ms = metrics.get("latency_ms")
+    tasks_completed = metrics.get("tasks_completed") or 0
+    tasks_failed = metrics.get("tasks_failed") or 0
+    total_tasks = (tasks_completed or 0) + (tasks_failed or 0)
+
+    # Default: assume healthy unless metrics say otherwise
+    state = "healthy"
+    reason = "normal"
+
+    error_rate = 0.0
+    if total_tasks > 0:
+        error_rate = float(tasks_failed) / float(total_tasks)
+
+    # High error rate with enough samples → suspect
+    if total_tasks >= SUSPECT_MIN_TASKS and error_rate >= SUSPECT_ERROR_RATE:
+        return "suspect", f"high_error_rate_{error_rate:.2f}"
+
+    # Elevated error rate → degraded
+    if total_tasks >= SUSPECT_MIN_TASKS and error_rate >= DEGRADED_ERROR_RATE:
+        state = "degraded"
+        reason = f"elevated_error_rate_{error_rate:.2f}"
+
+    # High latency alone can also degrade
+    if latency_ms is not None and latency_ms >= DEGRADED_LATENCY_MS:
+        if state == "healthy":
+            state = "degraded"
+            reason = f"high_latency_{latency_ms:.1f}ms"
+        else:
+            # already degraded due to errors; just annotate
+            reason += f"_and_high_latency_{latency_ms:.1f}ms"
+
+    return state, reason
+
+
+def _refresh_agent_states(now: Optional[float] = None) -> None:
+    """
+    Recompute health state for all agents.
+    NOTE: Must be called with STATE_LOCK held.
+    """
+    if now is None:
+        now = _now()
+
+    for info in AGENTS.values():
+        state, reason = _compute_agent_state(info, now)
+        info["state"] = state
+        info["health_reason"] = reason
+
+
 # -----------------------------------------------------------------------------
 # Health
 # -----------------------------------------------------------------------------
@@ -60,10 +148,18 @@ def healthz() -> str:
     Simple health check used by Docker/Portainer and UI.
     """
     with STATE_LOCK:
+        now = _now()
+        _refresh_agent_states(now)
         queue_len = len(TASK_QUEUE)
         agents_online = len(AGENTS)
+        # count non-dead agents as "active"
+        active_agents = sum(
+            1 for info in AGENTS.values()
+            if info.get("state") != "dead"
+        )
+
     return PlainTextResponse(
-        f"ok queue={queue_len} agents={agents_online}",
+        f"ok queue={queue_len} agents={agents_online} active_agents={active_agents}",
         media_type="text/plain",
     )
 
@@ -82,6 +178,8 @@ async def register_agent(request: Request) -> Dict[str, Any]:
       {"agent": "name", "labels": {...}, "capabilities": {...}}
     or:
       {"name": "name", ...}
+
+    Optionally may include basic metrics fields (cpu_util, ram_mb, etc.).
     """
     payload = await request.json()
     name = payload.get("agent") or payload.get("name")
@@ -92,23 +190,36 @@ async def register_agent(request: Request) -> Dict[str, Any]:
     capabilities = payload.get("capabilities") or {}
     now = _now()
 
+    # Extract optional metrics from payload
+    metrics: Dict[str, Any] = {}
+    for key in AGENT_METRIC_KEYS:
+        if key in payload:
+            metrics[key] = payload.get(key)
+
     with STATE_LOCK:
-        AGENTS[name] = {
+        info: Dict[str, Any] = {
             "labels": labels,
             "capabilities": capabilities,
             "last_seen": now,
+            "metrics": metrics,
         }
+        state, reason = _compute_agent_state(info, now)
+        info["state"] = state
+        info["health_reason"] = reason
+        AGENTS[name] = info
 
-    return {"status": "ok", "agent": name}
+    return {"status": "ok", "agent": name, "time": now}
 
 
 @app.post("/agents/heartbeat")
 @app.post("/api/agents/heartbeat")
 async def agent_heartbeat(request: Request) -> Dict[str, Any]:
     """
-    Agent heartbeat. Same shape as register.
+    Agent heartbeat. Same shape as register, but forgiving.
 
-    Controllers in the wild already use this heavily, so keep it forgiving.
+    Existing agents that only send {agent/name, labels, capabilities}
+    will continue to work. Newer agents can also send metrics:
+      cpu_util, ram_mb, tasks_completed, tasks_failed, avg_task_ms, latency_ms
     """
     payload = await request.json()
     name = payload.get("agent") or payload.get("name")
@@ -119,11 +230,28 @@ async def agent_heartbeat(request: Request) -> Dict[str, Any]:
     capabilities = payload.get("capabilities") or {}
     now = _now()
 
+    # Extract optional metrics from payload
+    metrics_update: Dict[str, Any] = {}
+    for key in AGENT_METRIC_KEYS:
+        if key in payload:
+            metrics_update[key] = payload.get(key)
+
     with STATE_LOCK:
         entry = AGENTS.get(name, {})
+        # merge labels/capabilities
         entry.setdefault("labels", {}).update(labels)
         entry.setdefault("capabilities", {}).update(capabilities)
         entry["last_seen"] = now
+        # merge metrics
+        existing_metrics = entry.get("metrics") or {}
+        existing_metrics.update(metrics_update)
+        entry["metrics"] = existing_metrics
+
+        # recompute health state
+        state, reason = _compute_agent_state(entry, now)
+        entry["state"] = state
+        entry["health_reason"] = reason
+
         AGENTS[name] = entry
 
     return {"status": "ok", "agent": name, "time": now}
@@ -132,14 +260,25 @@ async def agent_heartbeat(request: Request) -> Dict[str, Any]:
 @app.get("/agents")
 @app.get("/api/agents")
 def list_agents() -> Dict[str, Any]:
-    """Return agents in the shape the UI & your PS script expect."""
+    """
+    Return agents in the shape the UI & your PS script expect, plus:
+      - state
+      - health_reason
+      - metrics (if any)
+    """
     with STATE_LOCK:
+        now = _now()
+        _refresh_agent_states(now)
+
         # shallow copy so we don't leak internal refs
         return {
             name: {
                 "labels": dict(info.get("labels") or {}),
                 "capabilities": dict(info.get("capabilities") or {}),
                 "last_seen": info.get("last_seen"),
+                "state": info.get("state", "unknown"),
+                "health_reason": info.get("health_reason"),
+                "metrics": dict(info.get("metrics") or {}),
             }
             for name, info in AGENTS.items()
         }
@@ -161,6 +300,9 @@ def get_task(agent: str, wait_ms: int = 0):
     Returns:
       200 + JSON task if available
       204 if none available before wait_ms
+
+    NOTE: For now we do not block leasing based on health state.
+    Awareness first, enforcement later.
     """
     deadline = _now() + (wait_ms / 1000.0)
 
@@ -355,9 +497,15 @@ def stats() -> Dict[str, Any]:
       time, agents_online, queue_len, leased_total,
       completed_total, failed_total, rate_1s, rate_60s, rate_5m, rate_15m,
       op_counts, op_avg_ms
+
+    Plus:
+      agent_states: counts by health state
     """
     now = _now()
     with STATE_LOCK:
+        # refresh agent health states before reporting
+        _refresh_agent_states(now)
+
         agents_online = len(AGENTS)
         queue_len = len(TASK_QUEUE)
         leased_total = LEASED_TOTAL
@@ -377,6 +525,12 @@ def stats() -> Dict[str, Any]:
             for op, count in OP_COUNTS.items()
         }
 
+        # summarize agent states
+        agent_states: Dict[str, int] = defaultdict(int)
+        for info in AGENTS.values():
+            state = info.get("state") or "unknown"
+            agent_states[state] += 1
+
     return {
         "time": now,
         "agents_online": agents_online,
@@ -390,6 +544,7 @@ def stats() -> Dict[str, Any]:
         "rate_15m": rate_15m,
         "op_counts": op_counts,
         "op_avg_ms": op_avg_ms,
+        "agent_states": dict(agent_states),
     }
 
 
@@ -444,26 +599,14 @@ def stats_ops() -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# Seeding / purge / stress
+# Seeding / purge
 # -----------------------------------------------------------------------------
 
 @app.post("/seed")
 @app.post("/api/seed")  # extra compatibility; nginx usually strips /api
 async def seed(request: Request) -> Dict[str, Any]:
     """
-    Seed some demo jobs, mostly for your smaller smoke tests.
-
-    Body shape (new style):
-      {
-        "count": 50,
-        "op": "map_tokenize",
-        "payload_template": { ... }
-      }
-
-    If omitted:
-      - count defaults to 10
-      - op defaults to "map_tokenize"
-      - payload_template defaults to a simple fox sentence
+    Seed some demo jobs, mostly for your brutal smoke tests.
     """
     payload = await request.json()
     count = int(payload.get("count", 10))
@@ -475,198 +618,12 @@ async def seed(request: Request) -> Dict[str, Any]:
     job_ids = []
     with STATE_LOCK:
         for _ in range(count):
+            # naive template expansion
             body = dict(template)
             body["ts"] = _now()
             job_ids.append(_enqueue_job(op, body))
 
     return {"status": "ok", "count": count, "op": op, "job_ids": job_ids}
-
-
-def _stress_worker(
-    stress_id: str,
-    op: str,
-    template: Dict[str, Any],
-    total: int,
-    concurrency: int,
-    batch_delay_ms: int,
-) -> None:
-    """
-    Background worker that enqueues jobs in batches to simulate
-    controllable load and concurrency.
-    """
-    remaining = max(int(total), 0)
-    concurrency = max(int(concurrency), 1)
-    delay_s = max(batch_delay_ms, 0) / 1000.0
-
-    with STATE_LOCK:
-        run = STRESS_RUNS.get(stress_id)
-        if run is None:
-            return
-        run["status"] = "running"
-
-    while remaining > 0:
-        batch = min(concurrency, remaining)
-        job_ids: List[str] = []
-
-        with STATE_LOCK:
-            for _ in range(batch):
-                body = dict(template)
-                body["ts"] = _now()
-                body["stress_id"] = stress_id
-                job_ids.append(_enqueue_job(op, body))
-
-            run = STRESS_RUNS.get(stress_id)
-            if run is not None:
-                run["enqueued"] += batch
-                run.setdefault("job_ids", [])
-                # Don't let this list explode; keep it sampled
-                if len(run["job_ids"]) < 1000:
-                    run["job_ids"].extend(job_ids)
-
-        remaining -= batch
-        if remaining <= 0:
-            break
-        if delay_s > 0:
-            time.sleep(delay_s)
-
-    with STATE_LOCK:
-        run = STRESS_RUNS.get(stress_id)
-        if run is not None:
-            run["status"] = "completed"
-            run["completed_ts"] = _now()
-
-
-@app.post("/stress")
-@app.post("/api/stress")
-async def stress(request: Request) -> Dict[str, Any]:
-    """
-    High-load / stress endpoint.
-
-    Supports BOTH shapes:
-
-    Legacy style (what you've been using):
-      {
-        "type": "map_tokenize",
-        "payload": { ... },
-        "repeat": 200,
-        "concurrency": 10,
-        "batch_delay_ms": 250
-      }
-
-    New explicit style:
-      {
-        "op": "map_tokenize",
-        "payload_template": { ... },
-        "total": 200,
-        "concurrency": 10,
-        "batch_delay_ms": 250
-      }
-
-    Behavior:
-      - Enqueues `total` jobs in the background.
-      - Jobs are enqueued in batches of size `concurrency`.
-      - Wait `batch_delay_ms` between batches.
-      - Real concurrency is still governed by how many agents & workers you have,
-        but this lets you control how hard and how fast you push the queue.
-
-    Returns:
-      {
-        "status": "started",
-        "stress_id": "<uuid>",
-        "op": "...",
-        "total": ...,
-        "concurrency": ...,
-        "batch_delay_ms": ...
-      }
-    """
-    body = await request.json()
-
-    # Resolve op
-    op = body.get("op") or body.get("type") or "map_tokenize"
-
-    # Resolve template
-    template = body.get("payload_template") or body.get("payload") or {
-        "text": "The quick brown fox jumps over the lazy dog."
-    }
-
-    # Resolve total jobs
-    total = body.get("total")
-    if total is None:
-        total = body.get("count")
-    if total is None:
-        total = body.get("repeat")
-    if total is None:
-        total = 100
-    total = int(total)
-
-    # Concurrency & batch timing
-    concurrency = int(body.get("concurrency", 10))
-    batch_delay_ms = int(body.get("batch_delay_ms", 250))
-
-    stress_id = str(uuid.uuid4())
-    now = _now()
-
-    with STATE_LOCK:
-        STRESS_RUNS[stress_id] = {
-            "id": stress_id,
-            "created_ts": now,
-            "status": "pending",
-            "op": op,
-            "total": total,
-            "concurrency": concurrency,
-            "batch_delay_ms": batch_delay_ms,
-            "payload_template": dict(template),
-            "enqueued": 0,
-            "job_ids": [],
-        }
-
-    t = threading.Thread(
-        target=_stress_worker,
-        args=(stress_id, op, dict(template), total, concurrency, batch_delay_ms),
-        daemon=True,
-    )
-    t.start()
-
-    return {
-        "status": "started",
-        "stress_id": stress_id,
-        "op": op,
-        "total": total,
-        "concurrency": concurrency,
-        "batch_delay_ms": batch_delay_ms,
-    }
-
-
-@app.get("/stress")
-def list_stress_runs() -> List[Dict[str, Any]]:
-    """
-    List recent stress runs and their high-level status.
-    """
-    with STATE_LOCK:
-        runs = list(STRESS_RUNS.values())
-        runs.sort(key=lambda r: r.get("created_ts") or 0.0, reverse=True)
-        # Don't dump giant job_ids arrays every time
-        slimmed: List[Dict[str, Any]] = []
-        for r in runs:
-            r_copy = dict(r)
-            if "job_ids" in r_copy:
-                r_copy["job_ids_count"] = len(r_copy["job_ids"])
-                # hide the actual list in the listing view
-                r_copy.pop("job_ids", None)
-            slimmed.append(r_copy)
-        return slimmed
-
-
-@app.get("/stress/{stress_id}")
-def get_stress_run(stress_id: str) -> Dict[str, Any]:
-    """
-    Inspect a specific stress run by ID.
-    """
-    with STATE_LOCK:
-        run = STRESS_RUNS.get(stress_id)
-        if not run:
-            raise HTTPException(status_code=404, detail="Unknown stress_id")
-        return run
 
 
 @app.post("/purge")
@@ -675,7 +632,7 @@ def purge() -> Dict[str, Any]:
     Blow away all jobs and reset counters. Useful when you want a clean run.
     """
     global JOBS, TASK_QUEUE, LEASED_TOTAL, COMPLETED_TOTAL, FAILED_TOTAL
-    global COMPLETION_TIMES, OP_COUNTS, OP_TOTAL_MS, STRESS_RUNS
+    global COMPLETION_TIMES, OP_COUNTS, OP_TOTAL_MS
 
     with STATE_LOCK:
         JOBS = {}
@@ -686,6 +643,5 @@ def purge() -> Dict[str, Any]:
         COMPLETION_TIMES = []
         OP_COUNTS = defaultdict(int)
         OP_TOTAL_MS = defaultdict(float)
-        STRESS_RUNS = {}
 
     return {"status": "ok", "message": "purged"}
