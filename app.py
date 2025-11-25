@@ -6,6 +6,7 @@ from typing import Any, Deque, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
+from starlette.responses import Response
 
 app = FastAPI(title="Distributed Swarm Controller")
 
@@ -118,7 +119,6 @@ def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> (
             state = "degraded"
             reason = f"high_latency_{latency_ms:.1f}ms"
         else:
-            # already degraded due to errors; just annotate
             reason += f"_and_high_latency_{latency_ms:.1f}ms"
 
     return state, reason
@@ -152,7 +152,6 @@ def healthz() -> str:
         _refresh_agent_states(now)
         queue_len = len(TASK_QUEUE)
         agents_online = len(AGENTS)
-        # count non-dead agents as "active"
         active_agents = sum(
             1 for info in AGENTS.values()
             if info.get("state") != "dead"
@@ -178,8 +177,6 @@ async def register_agent(request: Request) -> Dict[str, Any]:
       {"agent": "name", "labels": {...}, "capabilities": {...}}
     or:
       {"name": "name", ...}
-
-    Optionally may include basic metrics fields (cpu_util, ram_mb, etc.).
     """
     payload = await request.json()
     name = payload.get("agent") or payload.get("name")
@@ -238,16 +235,14 @@ async def agent_heartbeat(request: Request) -> Dict[str, Any]:
 
     with STATE_LOCK:
         entry = AGENTS.get(name, {})
-        # merge labels/capabilities
         entry.setdefault("labels", {}).update(labels)
         entry.setdefault("capabilities", {}).update(capabilities)
         entry["last_seen"] = now
-        # merge metrics
+
         existing_metrics = entry.get("metrics") or {}
         existing_metrics.update(metrics_update)
         entry["metrics"] = existing_metrics
 
-        # recompute health state
         state, reason = _compute_agent_state(entry, now)
         entry["state"] = state
         entry["health_reason"] = reason
@@ -270,7 +265,6 @@ def list_agents() -> Dict[str, Any]:
         now = _now()
         _refresh_agent_states(now)
 
-        # shallow copy so we don't leak internal refs
         return {
             name: {
                 "labels": dict(info.get("labels") or {}),
@@ -315,8 +309,8 @@ def get_task(agent: str, wait_ms: int = 0):
             return JSONResponse(task)
 
         if _now() >= deadline:
-            # nothing to do
-            return JSONResponse(status_code=204, content=None)
+            # nothing to do: proper 204 with no body
+            return Response(status_code=204)
 
         # brief sleep to avoid hot-spinning the CPU
         time.sleep(0.05)
@@ -359,7 +353,6 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
         if not job:
             continue
 
-        # If job somehow already finished, skip
         if job["status"] not in ("queued", "leased"):
             continue
 
@@ -373,7 +366,6 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
             "payload": job["payload"],
         }
 
-    # no jobs
     return None
 
 
@@ -413,22 +405,18 @@ async def post_result(request: Request) -> Dict[str, Any]:
         job["error"] = payload.get("error")
         job["completed_ts"] = now
 
-        # duration
         duration_ms = payload.get("duration_ms")
         if duration_ms is None and job.get("leased_ts") is not None:
             duration_ms = (now - job["leased_ts"]) * 1000.0
         job["duration_ms"] = duration_ms
 
-        # update counters
         if ok:
             COMPLETED_TOTAL += 1
         else:
             FAILED_TOTAL += 1
 
-        # completion timeline (throughput & sparkline)
         COMPLETION_TIMES.append(now)
 
-        # op-level stats
         op = job.get("op") or payload.get("op") or "unknown"
         OP_COUNTS[op] += 1
         if duration_ms is not None:
@@ -493,17 +481,11 @@ def stats() -> Dict[str, Any]:
     """
     Summary stats for the UI.
 
-    Shape matches what your PowerShell output showed:
-      time, agents_online, queue_len, leased_total,
-      completed_total, failed_total, rate_1s, rate_60s, rate_5m, rate_15m,
-      op_counts, op_avg_ms
-
-    Plus:
+    Same as before, plus:
       agent_states: counts by health state
     """
     now = _now()
     with STATE_LOCK:
-        # refresh agent health states before reporting
         _refresh_agent_states(now)
 
         agents_online = len(AGENTS)
@@ -525,7 +507,6 @@ def stats() -> Dict[str, Any]:
             for op, count in OP_COUNTS.items()
         }
 
-        # summarize agent states
         agent_states: Dict[str, int] = defaultdict(int)
         for info in AGENTS.values():
             state = info.get("state") or "unknown"
@@ -606,7 +587,7 @@ def stats_ops() -> Dict[str, Any]:
 @app.post("/api/seed")  # extra compatibility; nginx usually strips /api
 async def seed(request: Request) -> Dict[str, Any]:
     """
-    Seed some demo jobs, mostly for your brutal smoke tests.
+    Seed some demo jobs, mostly for brutal smoke tests.
     """
     payload = await request.json()
     count = int(payload.get("count", 10))
@@ -618,7 +599,6 @@ async def seed(request: Request) -> Dict[str, Any]:
     job_ids = []
     with STATE_LOCK:
         for _ in range(count):
-            # naive template expansion
             body = dict(template)
             body["ts"] = _now()
             job_ids.append(_enqueue_job(op, body))
