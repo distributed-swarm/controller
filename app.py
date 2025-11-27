@@ -379,8 +379,9 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
       - If job payload has {"prefer_gpu": true, "min_vram_gb": X}
         then only agents with gpu_present == True and vram_gb >= X
         are allowed to take it.
-      - Non-qualifying agents skip that job and it is requeued at
-        the tail, so a GPU agent can pull it later.
+      - Non-qualifying agents skip those jobs (requeued at tail),
+        but we only scan each queued job once per call to avoid
+        infinite loops for CPU agents.
     """
     global LEASED_TOTAL
 
@@ -397,7 +398,13 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
     except (TypeError, ValueError):
         agent_vram_gb = 0.0
 
-    while TASK_QUEUE:
+    # Snapshot queue length so we only inspect each job once
+    queue_len = len(TASK_QUEUE)
+
+    for _ in range(queue_len):
+        if not TASK_QUEUE:
+            break
+
         job_id = TASK_QUEUE.popleft()
         job = JOBS.get(job_id)
         if not job:
@@ -434,6 +441,7 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
             "payload": job["payload"],
         }
 
+    # Nothing suitable for this agent right now
     return None
 
 
