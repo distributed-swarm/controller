@@ -372,10 +372,31 @@ def _enqueue_job(op: str, payload: Dict[str, Any]) -> str:
 
 
 def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
-    """Pop the next job from the queue and mark it leased."""
+    """
+    Pop the next job from the queue and mark it leased to `agent`.
+
+    GPU-aware behavior:
+      - If job payload has {"prefer_gpu": true, "min_vram_gb": X}
+        then only agents with gpu_present == True and vram_gb >= X
+        are allowed to take it.
+      - Non-qualifying agents skip that job and it is requeued at
+        the tail, so a GPU agent can pull it later.
+    """
     global LEASED_TOTAL
 
     now = _now()
+
+    # Look up this agent's GPU capabilities
+    agent_info = AGENTS.get(agent) or {}
+    wp = agent_info.get("worker_profile") or {}
+    gpu = wp.get("gpu") or {}
+
+    agent_has_gpu = bool(gpu.get("gpu_present"))
+    try:
+        agent_vram_gb = float(gpu.get("vram_gb", 0) or 0)
+    except (TypeError, ValueError):
+        agent_vram_gb = 0.0
+
     while TASK_QUEUE:
         job_id = TASK_QUEUE.popleft()
         job = JOBS.get(job_id)
@@ -385,10 +406,28 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
         if job["status"] not in ("queued", "leased"):
             continue
 
+        payload = job.get("payload") or {}
+
+        prefer_gpu = bool(payload.get("prefer_gpu", False))
+
+        min_vram_gb_raw = payload.get("min_vram_gb")
+        try:
+            min_vram_gb = float(min_vram_gb_raw) if min_vram_gb_raw is not None else 0.0
+        except (TypeError, ValueError):
+            min_vram_gb = 0.0
+
+        # If the job prefers GPU and this agent doesn't qualify, requeue & skip
+        if prefer_gpu:
+            if (not agent_has_gpu) or (agent_vram_gb < min_vram_gb):
+                TASK_QUEUE.append(job_id)
+                continue
+
+        # This agent is allowed to take the job → lease it
         job["status"] = "leased"
         job["leased_by"] = agent
         job["leased_ts"] = now
         LEASED_TOTAL += 1
+
         return {
             "id": job_id,
             "op": job["op"],
