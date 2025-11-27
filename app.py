@@ -174,9 +174,12 @@ async def register_agent(request: Request) -> Dict[str, Any]:
     Register an agent.
 
     Accepts either:
-      {"agent": "name", "labels": {...}, "capabilities": {...}}
+      {"agent": "name", "labels": {...}, "capabilities": {...}, "worker_profile": {...}}
     or:
       {"name": "name", ...}
+
+    Some agents send worker_profile nested under labels["worker_profile"],
+    so we fall back to that if needed.
     """
     payload = await request.json()
     name = payload.get("agent") or payload.get("name")
@@ -185,7 +188,13 @@ async def register_agent(request: Request) -> Dict[str, Any]:
 
     labels = payload.get("labels") or {}
     capabilities = payload.get("capabilities") or {}
-    worker_profile = payload.get("worker_profile") or {}  # NEW: full sizing incl. gpu/cpu
+
+    # Support worker_profile either at top-level or nested under labels
+    raw_worker_profile = payload.get("worker_profile")
+    if raw_worker_profile is None:
+        raw_worker_profile = labels.get("worker_profile")
+    worker_profile = raw_worker_profile or {}
+
     now = _now()
 
     # Extract optional metrics from payload
@@ -198,7 +207,7 @@ async def register_agent(request: Request) -> Dict[str, Any]:
         info: Dict[str, Any] = {
             "labels": labels,
             "capabilities": capabilities,
-            "worker_profile": worker_profile,  # NEW
+            "worker_profile": worker_profile,
             "last_seen": now,
             "metrics": metrics,
         }
@@ -220,6 +229,9 @@ async def agent_heartbeat(request: Request) -> Dict[str, Any]:
     will continue to work. Newer agents can also send:
       - metrics: cpu_util, ram_mb, tasks_completed, tasks_failed, avg_task_ms, latency_ms
       - worker_profile: { cpu: {...}, gpu: {...}, ... }
+
+    Some agents put worker_profile under labels["worker_profile"], so we
+    fall back to that if the top-level field is missing.
     """
     payload = await request.json()
     name = payload.get("agent") or payload.get("name")
@@ -228,7 +240,13 @@ async def agent_heartbeat(request: Request) -> Dict[str, Any]:
 
     labels = payload.get("labels") or {}
     capabilities = payload.get("capabilities") or {}
-    worker_profile = payload.get("worker_profile") or {}  # NEW
+
+    # Same fallback logic as register_agent
+    raw_worker_profile = payload.get("worker_profile")
+    if raw_worker_profile is None:
+        raw_worker_profile = labels.get("worker_profile")
+    worker_profile = raw_worker_profile or {}
+
     now = _now()
 
     # Extract optional metrics from payload
@@ -248,11 +266,10 @@ async def agent_heartbeat(request: Request) -> Dict[str, Any]:
         existing_metrics.update(metrics_update)
         entry["metrics"] = existing_metrics
 
-        # NEW: store / update worker_profile if present
+        # Store / update worker_profile
         if worker_profile:
             entry["worker_profile"] = worker_profile
         else:
-            # ensure key exists so code can safely assume it
             entry.setdefault("worker_profile", {})
 
         state, reason = _compute_agent_state(entry, now)
@@ -268,7 +285,7 @@ async def agent_heartbeat(request: Request) -> Dict[str, Any]:
 @app.get("/api/agents")
 def list_agents() -> Dict[str, Any]:
     """
-    Return agents in the shape the UI & your PS script expect, plus:
+    Return agents in the shape the UI & scripts expect, plus:
       - state
       - health_reason
       - metrics (if any)
@@ -286,7 +303,7 @@ def list_agents() -> Dict[str, Any]:
                 "state": info.get("state", "unknown"),
                 "health_reason": info.get("health_reason"),
                 "metrics": dict(info.get("metrics") or {}),
-                "worker_profile": dict(info.get("worker_profile") or {}),  # NEW
+                "worker_profile": dict(info.get("worker_profile") or {}),
             }
             for name, info in AGENTS.items()
         }
@@ -323,10 +340,8 @@ def get_task(agent: str, wait_ms: int = 0):
             return JSONResponse(task)
 
         if _now() >= deadline:
-            # nothing to do: proper 204 with no body
             return Response(status_code=204)
 
-        # brief sleep to avoid hot-spinning the CPU
         time.sleep(0.05)
 
 
@@ -495,7 +510,7 @@ def stats() -> Dict[str, Any]:
     """
     Summary stats for the UI.
 
-    Same as before, plus:
+    Includes:
       - agent_states: counts by health state
       - gpu_agents_online: number of agents with gpu_present == True
       - total_gpu_vram_gb: sum of vram_gb over gpu agents
@@ -560,8 +575,8 @@ def stats() -> Dict[str, Any]:
         "op_counts": op_counts,
         "op_avg_ms": op_avg_ms,
         "agent_states": dict(agent_states),
-        "gpu_agents_online": gpu_agents_online,      # NEW
-        "total_gpu_vram_gb": total_gpu_vram_gb,      # NEW
+        "gpu_agents_online": gpu_agents_online,
+        "total_gpu_vram_gb": total_gpu_vram_gb,
     }
 
 
@@ -620,10 +635,10 @@ def stats_ops() -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 
 @app.post("/seed")
-@app.post("/api/seed")  # extra compatibility; nginx usually strips /api
+@app.post("/api/seed")
 async def seed(request: Request) -> Dict[str, Any]:
     """
-    Seed some demo jobs, mostly for brutal smoke tests.
+    Seed some demo jobs, mostly for smoke tests.
     """
     payload = await request.json()
     count = int(payload.get("count", 10))
