@@ -185,6 +185,7 @@ async def register_agent(request: Request) -> Dict[str, Any]:
 
     labels = payload.get("labels") or {}
     capabilities = payload.get("capabilities") or {}
+    worker_profile = payload.get("worker_profile") or {}  # NEW: full sizing incl. gpu/cpu
     now = _now()
 
     # Extract optional metrics from payload
@@ -197,6 +198,7 @@ async def register_agent(request: Request) -> Dict[str, Any]:
         info: Dict[str, Any] = {
             "labels": labels,
             "capabilities": capabilities,
+            "worker_profile": worker_profile,  # NEW
             "last_seen": now,
             "metrics": metrics,
         }
@@ -215,8 +217,9 @@ async def agent_heartbeat(request: Request) -> Dict[str, Any]:
     Agent heartbeat. Same shape as register, but forgiving.
 
     Existing agents that only send {agent/name, labels, capabilities}
-    will continue to work. Newer agents can also send metrics:
-      cpu_util, ram_mb, tasks_completed, tasks_failed, avg_task_ms, latency_ms
+    will continue to work. Newer agents can also send:
+      - metrics: cpu_util, ram_mb, tasks_completed, tasks_failed, avg_task_ms, latency_ms
+      - worker_profile: { cpu: {...}, gpu: {...}, ... }
     """
     payload = await request.json()
     name = payload.get("agent") or payload.get("name")
@@ -225,6 +228,7 @@ async def agent_heartbeat(request: Request) -> Dict[str, Any]:
 
     labels = payload.get("labels") or {}
     capabilities = payload.get("capabilities") or {}
+    worker_profile = payload.get("worker_profile") or {}  # NEW
     now = _now()
 
     # Extract optional metrics from payload
@@ -239,9 +243,17 @@ async def agent_heartbeat(request: Request) -> Dict[str, Any]:
         entry.setdefault("capabilities", {}).update(capabilities)
         entry["last_seen"] = now
 
+        # Merge / update metrics
         existing_metrics = entry.get("metrics") or {}
         existing_metrics.update(metrics_update)
         entry["metrics"] = existing_metrics
+
+        # NEW: store / update worker_profile if present
+        if worker_profile:
+            entry["worker_profile"] = worker_profile
+        else:
+            # ensure key exists so code can safely assume it
+            entry.setdefault("worker_profile", {})
 
         state, reason = _compute_agent_state(entry, now)
         entry["state"] = state
@@ -260,6 +272,7 @@ def list_agents() -> Dict[str, Any]:
       - state
       - health_reason
       - metrics (if any)
+      - worker_profile (if any)
     """
     with STATE_LOCK:
         now = _now()
@@ -273,6 +286,7 @@ def list_agents() -> Dict[str, Any]:
                 "state": info.get("state", "unknown"),
                 "health_reason": info.get("health_reason"),
                 "metrics": dict(info.get("metrics") or {}),
+                "worker_profile": dict(info.get("worker_profile") or {}),  # NEW
             }
             for name, info in AGENTS.items()
         }
@@ -482,7 +496,9 @@ def stats() -> Dict[str, Any]:
     Summary stats for the UI.
 
     Same as before, plus:
-      agent_states: counts by health state
+      - agent_states: counts by health state
+      - gpu_agents_online: number of agents with gpu_present == True
+      - total_gpu_vram_gb: sum of vram_gb over gpu agents
     """
     now = _now()
     with STATE_LOCK:
@@ -508,9 +524,27 @@ def stats() -> Dict[str, Any]:
         }
 
         agent_states: Dict[str, int] = defaultdict(int)
+        gpu_agents_online = 0
+        total_gpu_vram_gb = 0.0
+
         for info in AGENTS.values():
             state = info.get("state") or "unknown"
             agent_states[state] += 1
+
+            wp = info.get("worker_profile") or {}
+            if isinstance(wp, dict):
+                gpu = wp.get("gpu") or {}
+            else:
+                gpu = {}
+
+            gpu_present = bool(gpu.get("gpu_present"))
+            if gpu_present:
+                gpu_agents_online += 1
+                try:
+                    vram = float(gpu.get("vram_gb", 0) or 0)
+                except (TypeError, ValueError):
+                    vram = 0.0
+                total_gpu_vram_gb += vram
 
     return {
         "time": now,
@@ -526,6 +560,8 @@ def stats() -> Dict[str, Any]:
         "op_counts": op_counts,
         "op_avg_ms": op_avg_ms,
         "agent_states": dict(agent_states),
+        "gpu_agents_online": gpu_agents_online,      # NEW
+        "total_gpu_vram_gb": total_gpu_vram_gb,      # NEW
     }
 
 
