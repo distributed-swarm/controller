@@ -29,6 +29,10 @@ COMPLETION_TIMES: List[float] = []
 OP_COUNTS: Dict[str, int] = defaultdict(int)
 OP_TOTAL_MS: Dict[str, float] = defaultdict(float)
 
+# Health events ring buffer (state transitions, auto-quarantine, etc.)
+HEALTH_EVENTS: List[Dict[str, Any]] = []
+HEALTH_EVENTS_MAX = 500
+
 # -----------------------------------------------------------------------------
 # Agent health / autonomic thresholds
 # -----------------------------------------------------------------------------
@@ -75,6 +79,43 @@ def _prune_completion_times(now: Optional[float] = None, window_s: float = 900.0
         i += 1
     if i > 0:
         del COMPLETION_TIMES[:i]
+
+
+def _emit_health_event(
+    name: str,
+    old_state: Optional[str],
+    new_state: str,
+    old_reason: Optional[str],
+    new_reason: Optional[str],
+    ts: Optional[float] = None,
+) -> None:
+    """
+    Record a health state transition for an agent.
+    Stored in a simple ring buffer HEALTH_EVENTS.
+    """
+    global HEALTH_EVENTS
+
+    if ts is None:
+        ts = _now()
+
+    # Ignore non-transitions
+    if old_state == new_state:
+        return
+
+    event = {
+        "ts": ts,
+        "agent": name,
+        "old_state": old_state,
+        "new_state": new_state,
+        "old_reason": old_reason,
+        "new_reason": new_reason,
+    }
+    HEALTH_EVENTS.append(event)
+
+    # Ring buffer trim
+    if len(HEALTH_EVENTS) > HEALTH_EVENTS_MAX:
+        overflow = len(HEALTH_EVENTS) - HEALTH_EVENTS_MAX
+        del HEALTH_EVENTS[:overflow]
 
 
 def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> (str, str):
@@ -163,6 +204,24 @@ def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> (
     return state, reason
 
 
+def _set_agent_health(name: str, entry: Dict[str, Any], state: str, reason: str, now: Optional[float] = None) -> None:
+    """
+    Helper to set agent state + reason and emit health events on transitions.
+    NOTE: Must be called with STATE_LOCK held.
+    """
+    if now is None:
+        now = _now()
+
+    old_state = entry.get("state")
+    old_reason = entry.get("health_reason")
+
+    entry["state"] = state
+    entry["health_reason"] = reason
+    AGENTS[name] = entry
+
+    _emit_health_event(name, old_state, state, old_reason, reason, ts=now)
+
+
 def _refresh_agent_states(now: Optional[float] = None) -> None:
     """
     Recompute health state for all agents.
@@ -171,10 +230,9 @@ def _refresh_agent_states(now: Optional[float] = None) -> None:
     if now is None:
         now = _now()
 
-    for info in AGENTS.values():
+    for name, info in AGENTS.items():
         state, reason = _compute_agent_state(info, now)
-        info["state"] = state
-        info["health_reason"] = reason
+        _set_agent_health(name, info, state, reason, now)
 
 
 # -----------------------------------------------------------------------------
@@ -219,9 +277,7 @@ async def _lease_reaper_loop(interval_s: float = 1.0) -> None:
                         entry["metrics"] = metrics
 
                         state, reason = _compute_agent_state(entry, now)
-                        entry["state"] = state
-                        entry["health_reason"] = reason
-                        AGENTS[agent_name] = entry
+                        _set_agent_health(agent_name, entry, state, reason, now)
 
                     # Lease expired → return to queue
                     job["status"] = "queued"
@@ -319,9 +375,7 @@ async def register_agent(request: Request) -> Dict[str, Any]:
             "metrics": metrics,
         }
         state, reason = _compute_agent_state(info, now)
-        info["state"] = state
-        info["health_reason"] = reason
-        AGENTS[name] = info
+        _set_agent_health(name, info, state, reason, now)
 
     return {"status": "ok", "agent": name, "time": now}
 
@@ -380,10 +434,7 @@ async def agent_heartbeat(request: Request) -> Dict[str, Any]:
             entry.setdefault("worker_profile", {})
 
         state, reason = _compute_agent_state(entry, now)
-        entry["state"] = state
-        entry["health_reason"] = reason
-
-        AGENTS[name] = entry
+        _set_agent_health(name, entry, state, reason, now)
 
     return {"status": "ok", "agent": name, "time": now}
 
@@ -424,13 +475,13 @@ async def quarantine_agent(name: str, request: Request) -> Dict[str, Any]:
     """
     reason_default = "manual_quarantine"
 
-    body: Dict[str, Any] = {}
     try:
         body = await request.json()
     except Exception:
         body = {}
 
     manual_reason = body.get("reason", reason_default)
+    now = _now()
 
     with STATE_LOCK:
         entry = AGENTS.get(name)
@@ -440,11 +491,8 @@ async def quarantine_agent(name: str, request: Request) -> Dict[str, Any]:
         entry["manual_state"] = "quarantined"
         entry["manual_reason"] = manual_reason
 
-        state, reason = _compute_agent_state(entry, _now())
-        entry["state"] = state
-        entry["health_reason"] = reason
-
-        AGENTS[name] = entry
+        state, reason = _compute_agent_state(entry, now)
+        _set_agent_health(name, entry, state, reason, now)
 
     return {"status": "ok", "agent": name, "state": state, "reason": reason}
 
@@ -455,6 +503,8 @@ async def restore_agent(name: str) -> Dict[str, Any]:
     """
     Clear manual quarantine/ban and let health be computed from metrics again.
     """
+    now = _now()
+
     with STATE_LOCK:
         entry = AGENTS.get(name)
         if not entry:
@@ -463,11 +513,8 @@ async def restore_agent(name: str) -> Dict[str, Any]:
         entry.pop("manual_state", None)
         entry.pop("manual_reason", None)
 
-        state, reason = _compute_agent_state(entry, _now())
-        entry["state"] = state
-        entry["health_reason"] = reason
-
-        AGENTS[name] = entry
+        state, reason = _compute_agent_state(entry, now)
+        _set_agent_health(name, entry, state, reason, now)
 
     return {"status": "ok", "agent": name, "state": state, "reason": reason}
 
@@ -480,13 +527,13 @@ async def ban_agent(name: str, request: Request) -> Dict[str, Any]:
     """
     reason_default = "manual_ban"
 
-    body: Dict[str, Any] = {}
     try:
         body = await request.json()
     except Exception:
         body = {}
 
     manual_reason = body.get("reason", reason_default)
+    now = _now()
 
     with STATE_LOCK:
         entry = AGENTS.get(name)
@@ -496,13 +543,42 @@ async def ban_agent(name: str, request: Request) -> Dict[str, Any]:
         entry["manual_state"] = "banned"
         entry["manual_reason"] = manual_reason
 
-        state, reason = _compute_agent_state(entry, _now())
-        entry["state"] = state
-        entry["health_reason"] = reason
-
-        AGENTS[name] = entry
+        state, reason = _compute_agent_state(entry, now)
+        _set_agent_health(name, entry, state, reason, now)
 
     return {"status": "ok", "agent": name, "state": state, "reason": reason}
+
+
+# -----------------------------------------------------------------------------
+# Health events endpoints
+# -----------------------------------------------------------------------------
+
+@app.get("/events")
+@app.get("/api/events")
+def list_events(limit: int = 200) -> Dict[str, Any]:
+    """
+    Return recent health events (state transitions, auto-quarantine, etc.).
+    Most recent last. Limit defaults to 200.
+    """
+    with STATE_LOCK:
+        if limit <= 0:
+            data = []
+        else:
+            data = HEALTH_EVENTS[-limit:]
+
+    return {"events": data}
+
+
+@app.post("/events/clear")
+@app.post("/api/events/clear")
+def clear_events() -> Dict[str, Any]:
+    """
+    Clear the in-memory health event buffer.
+    """
+    global HEALTH_EVENTS
+    with STATE_LOCK:
+        HEALTH_EVENTS = []
+    return {"status": "ok", "cleared": True}
 
 
 # -----------------------------------------------------------------------------
@@ -765,9 +841,7 @@ async def post_result(request: Request) -> Dict[str, Any]:
 
             # Recompute health state with updated metrics
             state, reason = _compute_agent_state(entry, now)
-            entry["state"] = state
-            entry["health_reason"] = reason
-            AGENTS[agent_name] = entry
+            _set_agent_health(agent_name, entry, state, reason, now)
 
     return {"status": "ok", "id": job_id}
 
