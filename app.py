@@ -1,3 +1,4 @@
+import asyncio
 import time
 import uuid
 import threading
@@ -136,6 +137,60 @@ def _refresh_agent_states(now: Optional[float] = None) -> None:
         state, reason = _compute_agent_state(info, now)
         info["state"] = state
         info["health_reason"] = reason
+
+
+# -----------------------------------------------------------------------------
+# Lease reaper (brainstem Option A)
+# -----------------------------------------------------------------------------
+
+async def _lease_reaper_loop(interval_s: float = 1.0) -> None:
+    """
+    Periodically scan for leased jobs whose lease_timeout_s has expired and
+    return them to the TASK_QUEUE as queued.
+
+    This is the "laptop died / agent vanished" recovery.
+    """
+    while True:
+        now = _now()
+        reclaimed = 0
+
+        with STATE_LOCK:
+            for job_id, job in list(JOBS.items()):
+                if job.get("status") != "leased":
+                    continue
+
+                leased_ts = job.get("leased_ts")
+                timeout_s = job.get("lease_timeout_s") or 0
+                if leased_ts is None or timeout_s <= 0:
+                    continue
+
+                try:
+                    leased_ts_f = float(leased_ts)
+                    timeout_f = float(timeout_s)
+                except (TypeError, ValueError):
+                    continue
+
+                if now - leased_ts_f > timeout_f:
+                    # Lease expired → return to queue
+                    job["status"] = "queued"
+                    job["leased_ts"] = None
+                    job["leased_by"] = None
+                    TASK_QUEUE.append(job_id)
+                    reclaimed += 1
+
+        # If you want logging, you can uncomment:
+        # if reclaimed:
+        #     print(f"[reaper] reclaimed {reclaimed} jobs this tick")
+
+        await asyncio.sleep(interval_s)
+
+
+@app.on_event("startup")
+async def controller_startup() -> None:
+    """
+    Startup hook: launches the lease reaper in the background.
+    """
+    asyncio.create_task(_lease_reaper_loop())
 
 
 # -----------------------------------------------------------------------------
@@ -359,6 +414,7 @@ def _enqueue_job(op: str, payload: Dict[str, Any]) -> str:
         "created_ts": _now(),
         "leased_ts": None,
         "leased_by": None,
+        # Lease timeout in seconds; used by _lease_reaper_loop
         "lease_timeout_s": 300,
         "status": "queued",  # queued | leased | completed | failed
         "result": None,
@@ -445,6 +501,10 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+# -----------------------------------------------------------------------------
+# Results: idempotent completion
+# -----------------------------------------------------------------------------
+
 @app.post("/result")
 @app.post("/api/result")
 async def post_result(request: Request) -> Dict[str, Any]:
@@ -460,6 +520,11 @@ async def post_result(request: Request) -> Dict[str, Any]:
       "op": "map_tokenize",
       "duration_ms": float | null
     }
+
+    Idempotent behavior:
+      - First completion for a job sets status & counters.
+      - Subsequent completions for the same job_id are ignored
+        and do not change status or metrics.
     """
     global COMPLETED_TOTAL, FAILED_TOTAL
 
@@ -473,7 +538,14 @@ async def post_result(request: Request) -> Dict[str, Any]:
     with STATE_LOCK:
         job = JOBS.get(job_id)
         if not job:
-            raise HTTPException(status_code=404, detail="Unknown job id")
+            # Old agents might retry; better to 200/ignore than 404-loop them.
+            return {"status": "ignored", "id": job_id, "reason": "unknown_job_id"}
+
+        prev_status = job.get("status")
+
+        # If we've already marked this job completed/failed, ignore duplicates.
+        if prev_status in ("completed", "failed"):
+            return {"status": "ignored", "id": job_id, "reason": "duplicate_result"}
 
         ok = bool(payload.get("ok", True))
         job["status"] = "completed" if ok else "failed"
