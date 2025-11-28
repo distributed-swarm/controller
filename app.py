@@ -36,18 +36,23 @@ OP_TOTAL_MS: Dict[str, float] = defaultdict(float)
 # How long an agent can go without a heartbeat before we call it "dead"
 DEAD_AGENT_THRESHOLD_S = 60.0
 
-# Latency / error thresholds for degraded / suspect classification
+# Latency / error thresholds for degraded classification
 DEGRADED_LATENCY_MS = 500.0       # above this, we start to worry
 DEGRADED_ERROR_RATE = 0.10        # >10% failures → degraded (if enough samples)
-SUSPECT_ERROR_RATE = 0.50         # >50% failures with enough volume → suspect
-SUSPECT_MIN_TASKS = 5             # only call it suspect if it's actually done work
+
+# Auto-quarantine thresholds based on controller-observed metrics
+AUTO_QUARANTINE_ERROR_RATE = 0.50     # >50% failures → quarantine
+AUTO_QUARANTINE_MIN_TASKS = 10        # only quarantine if there's enough volume
+AUTO_QUARANTINE_MAX_TIMEOUTS = 5      # too many lease timeouts → quarantine
+
+SUSPECT_MIN_TASKS = 5                 # still used for degraded thresholding
 
 # Metrics we accept from agents in heartbeat/register payloads
 AGENT_METRIC_KEYS = [
     "cpu_util",        # float 0..1
     "ram_mb",          # float or int
-    "tasks_completed", # cumulative
-    "tasks_failed",    # cumulative
+    "tasks_completed", # cumulative from agent
+    "tasks_failed",    # cumulative from agent
     "avg_task_ms",     # moving average duration
     "latency_ms",      # observed round-trip latency
 ]
@@ -74,14 +79,26 @@ def _prune_completion_times(now: Optional[float] = None, window_s: float = 900.0
 
 def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> (str, str):
     """
-    Compute a coarse health state for an agent based on last_seen + metrics.
+    Compute a health state for an agent based on:
+      - last_seen
+      - controller-observed metrics (ctrl_*)
+      - agent-reported metrics (fallback)
+      - manual_state overrides (quarantined / banned)
 
     Returns:
       (state, reason)
-      state ∈ {"healthy", "degraded", "suspect", "dead", "unknown"}
+      state ∈ {"healthy", "degraded", "quarantined", "banned", "dead", "unknown"}
     """
     if now is None:
         now = _now()
+
+    # Manual override wins
+    manual_state = info.get("manual_state")
+    manual_reason = info.get("manual_reason") or "manual_override"
+    if manual_state == "quarantined":
+        return "quarantined", manual_reason
+    if manual_state == "banned":
+        return "banned", manual_reason
 
     last_seen = info.get("last_seen")
     if last_seen is None:
@@ -92,12 +109,30 @@ def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> (
         return "dead", "missed_heartbeat"
 
     metrics = info.get("metrics") or {}
-    latency_ms = metrics.get("latency_ms")
-    tasks_completed = metrics.get("tasks_completed") or 0
-    tasks_failed = metrics.get("tasks_failed") or 0
-    total_tasks = (tasks_completed or 0) + (tasks_failed or 0)
 
-    # Default: assume healthy unless metrics say otherwise
+    # Prefer controller-maintained metrics over agent-reported ones
+    ctrl_completed = int(metrics.get("ctrl_tasks_completed", 0) or 0)
+    ctrl_failed = int(metrics.get("ctrl_tasks_failed", 0) or 0)
+    ctrl_timeouts = int(metrics.get("ctrl_lease_timeouts", 0) or 0)
+    ctrl_avg_latency_ms = metrics.get("ctrl_avg_latency_ms")
+
+    agent_completed = int(metrics.get("tasks_completed", 0) or 0)
+    agent_failed = int(metrics.get("tasks_failed", 0) or 0)
+    agent_latency_ms = metrics.get("latency_ms")
+
+    # Effective counts
+    if ctrl_completed or ctrl_failed:
+        tasks_completed = ctrl_completed
+        tasks_failed = ctrl_failed
+    else:
+        tasks_completed = agent_completed
+        tasks_failed = agent_failed
+
+    total_tasks = tasks_completed + tasks_failed
+
+    # Choose latency source
+    latency_ms = ctrl_avg_latency_ms if ctrl_avg_latency_ms is not None else agent_latency_ms
+
     state = "healthy"
     reason = "normal"
 
@@ -105,16 +140,19 @@ def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> (
     if total_tasks > 0:
         error_rate = float(tasks_failed) / float(total_tasks)
 
-    # High error rate with enough samples → suspect
-    if total_tasks >= SUSPECT_MIN_TASKS and error_rate >= SUSPECT_ERROR_RATE:
-        return "suspect", f"high_error_rate_{error_rate:.2f}"
+    # --- Auto-quarantine: too many errors / timeouts -------------------------
+    if total_tasks >= AUTO_QUARANTINE_MIN_TASKS and error_rate >= AUTO_QUARANTINE_ERROR_RATE:
+        return "quarantined", f"auto_quarantine_high_error_rate_{error_rate:.2f}"
 
-    # Elevated error rate → degraded
+    if ctrl_timeouts >= AUTO_QUARANTINE_MAX_TIMEOUTS:
+        return "quarantined", f"auto_quarantine_lease_timeouts_{ctrl_timeouts}"
+
+    # --- Degraded: elevated error rate --------------------------------------
     if total_tasks >= SUSPECT_MIN_TASKS and error_rate >= DEGRADED_ERROR_RATE:
         state = "degraded"
         reason = f"elevated_error_rate_{error_rate:.2f}"
 
-    # High latency alone can also degrade
+    # --- Degraded: high latency ---------------------------------------------
     if latency_ms is not None and latency_ms >= DEGRADED_LATENCY_MS:
         if state == "healthy":
             state = "degraded"
@@ -148,7 +186,7 @@ async def _lease_reaper_loop(interval_s: float = 1.0) -> None:
     Periodically scan for leased jobs whose lease_timeout_s has expired and
     return them to the TASK_QUEUE as queued.
 
-    This is the "laptop died / agent vanished" recovery.
+    Also increments per-agent ctrl_lease_timeouts, which feeds health state.
     """
     while True:
         now = _now()
@@ -171,6 +209,20 @@ async def _lease_reaper_loop(interval_s: float = 1.0) -> None:
                     continue
 
                 if now - leased_ts_f > timeout_f:
+                    # Record a lease timeout against the agent, if known
+                    agent_name = job.get("leased_by")
+                    if agent_name and agent_name in AGENTS:
+                        entry = AGENTS[agent_name]
+                        metrics = entry.get("metrics") or {}
+                        timeouts = int(metrics.get("ctrl_lease_timeouts", 0) or 0)
+                        metrics["ctrl_lease_timeouts"] = timeouts + 1
+                        entry["metrics"] = metrics
+
+                        state, reason = _compute_agent_state(entry, now)
+                        entry["state"] = state
+                        entry["health_reason"] = reason
+                        AGENTS[agent_name] = entry
+
                     # Lease expired → return to queue
                     job["status"] = "queued"
                     job["leased_ts"] = None
@@ -178,7 +230,7 @@ async def _lease_reaper_loop(interval_s: float = 1.0) -> None:
                     TASK_QUEUE.append(job_id)
                     reclaimed += 1
 
-        # If you want logging, you can uncomment:
+        # Uncomment if you want spammy logs:
         # if reclaimed:
         #     print(f"[reaper] reclaimed {reclaimed} jobs this tick")
 
@@ -364,6 +416,95 @@ def list_agents() -> Dict[str, Any]:
         }
 
 
+@app.post("/agents/{name}/quarantine")
+@app.post("/api/agents/{name}/quarantine")
+async def quarantine_agent(name: str, request: Request) -> Dict[str, Any]:
+    """
+    Manually quarantine an agent: it will receive no new work until restored.
+    """
+    reason_default = "manual_quarantine"
+
+    body: Dict[str, Any] = {}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    manual_reason = body.get("reason", reason_default)
+
+    with STATE_LOCK:
+        entry = AGENTS.get(name)
+        if not entry:
+            raise HTTPException(status_code=404, detail="Unknown agent")
+
+        entry["manual_state"] = "quarantined"
+        entry["manual_reason"] = manual_reason
+
+        state, reason = _compute_agent_state(entry, _now())
+        entry["state"] = state
+        entry["health_reason"] = reason
+
+        AGENTS[name] = entry
+
+    return {"status": "ok", "agent": name, "state": state, "reason": reason}
+
+
+@app.post("/agents/{name}/restore")
+@app.post("/api/agents/{name}/restore")
+async def restore_agent(name: str) -> Dict[str, Any]:
+    """
+    Clear manual quarantine/ban and let health be computed from metrics again.
+    """
+    with STATE_LOCK:
+        entry = AGENTS.get(name)
+        if not entry:
+            raise HTTPException(status_code=404, detail="Unknown agent")
+
+        entry.pop("manual_state", None)
+        entry.pop("manual_reason", None)
+
+        state, reason = _compute_agent_state(entry, _now())
+        entry["state"] = state
+        entry["health_reason"] = reason
+
+        AGENTS[name] = entry
+
+    return {"status": "ok", "agent": name, "state": state, "reason": reason}
+
+
+@app.post("/agents/{name}/ban")
+@app.post("/api/agents/{name}/ban")
+async def ban_agent(name: str, request: Request) -> Dict[str, Any]:
+    """
+    Permanently ban an agent from receiving work unless manually restored.
+    """
+    reason_default = "manual_ban"
+
+    body: Dict[str, Any] = {}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    manual_reason = body.get("reason", reason_default)
+
+    with STATE_LOCK:
+        entry = AGENTS.get(name)
+        if not entry:
+            raise HTTPException(status_code=404, detail="Unknown agent")
+
+        entry["manual_state"] = "banned"
+        entry["manual_reason"] = manual_reason
+
+        state, reason = _compute_agent_state(entry, _now())
+        entry["state"] = state
+        entry["health_reason"] = reason
+
+        AGENTS[name] = entry
+
+    return {"status": "ok", "agent": name, "state": state, "reason": reason}
+
+
 # -----------------------------------------------------------------------------
 # Task leasing
 # -----------------------------------------------------------------------------
@@ -380,9 +521,6 @@ def get_task(agent: str, wait_ms: int = 0):
     Returns:
       200 + JSON task if available
       204 if none available before wait_ms
-
-    NOTE: For now we do not block leasing based on health state.
-    Awareness first, enforcement later.
     """
     deadline = _now() + (wait_ms / 1000.0)
 
@@ -431,6 +569,9 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
     """
     Pop the next job from the queue and mark it leased to `agent`.
 
+    Health-aware behavior:
+      - Agents in state dead / quarantined / banned will receive no work.
+
     GPU-aware behavior:
       - If job payload has {"prefer_gpu": true, "min_vram_gb": X}
         then only agents with gpu_present == True and vram_gb >= X
@@ -443,8 +584,14 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
 
     now = _now()
 
-    # Look up this agent's GPU capabilities
+    # Look up this agent's health + GPU capabilities
     agent_info = AGENTS.get(agent) or {}
+    agent_state = agent_info.get("state") or "unknown"
+
+    # Hard block for obviously bad states
+    if agent_state in ("dead", "quarantined", "banned"):
+        return None
+
     wp = agent_info.get("worker_profile") or {}
     gpu = wp.get("gpu") or {}
 
@@ -502,7 +649,7 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
 
 
 # -----------------------------------------------------------------------------
-# Results: idempotent completion
+# Results: idempotent completion + health metrics
 # -----------------------------------------------------------------------------
 
 @app.post("/result")
@@ -525,6 +672,12 @@ async def post_result(request: Request) -> Dict[str, Any]:
       - First completion for a job sets status & counters.
       - Subsequent completions for the same job_id are ignored
         and do not change status or metrics.
+
+    Also updates controller-observed per-agent metrics:
+      - ctrl_tasks_completed / ctrl_tasks_failed
+      - ctrl_error_rate
+      - ctrl_avg_latency_ms
+      - ctrl_latency_samples
     """
     global COMPLETED_TOTAL, FAILED_TOTAL
 
@@ -533,6 +686,7 @@ async def post_result(request: Request) -> Dict[str, Any]:
     if not job_id:
         raise HTTPException(status_code=400, detail="Missing 'id'")
 
+    agent_name = payload.get("agent")
     now = _now()
 
     with STATE_LOCK:
@@ -569,6 +723,51 @@ async def post_result(request: Request) -> Dict[str, Any]:
         OP_COUNTS[op] += 1
         if duration_ms is not None:
             OP_TOTAL_MS[op] += float(duration_ms)
+
+        # --- Update controller-side per-agent metrics -----------------------
+        if agent_name and agent_name in AGENTS:
+            entry = AGENTS[agent_name]
+            metrics = entry.get("metrics") or {}
+
+            ctrl_completed = int(metrics.get("ctrl_tasks_completed", 0) or 0)
+            ctrl_failed = int(metrics.get("ctrl_tasks_failed", 0) or 0)
+            if ok:
+                ctrl_completed += 1
+            else:
+                ctrl_failed += 1
+
+            total = ctrl_completed + ctrl_failed
+            error_rate = float(ctrl_failed) / float(total) if total > 0 else 0.0
+
+            # Moving average latency
+            if duration_ms is not None:
+                prev_avg = float(metrics.get("ctrl_avg_latency_ms", 0.0) or 0.0)
+                prev_n = int(metrics.get("ctrl_latency_samples", 0) or 0)
+                new_n = prev_n + 1
+                new_avg = (prev_avg * prev_n + float(duration_ms)) / max(new_n, 1)
+            else:
+                new_n = int(metrics.get("ctrl_latency_samples", 0) or 0)
+                new_avg = float(metrics.get("ctrl_avg_latency_ms", 0.0) or 0.0)
+
+            metrics.update(
+                {
+                    "ctrl_tasks_completed": ctrl_completed,
+                    "ctrl_tasks_failed": ctrl_failed,
+                    "ctrl_error_rate": error_rate,
+                    "ctrl_avg_latency_ms": new_avg,
+                    "ctrl_latency_samples": new_n,
+                }
+            )
+            if not ok:
+                metrics["ctrl_last_failure_ts"] = now
+
+            entry["metrics"] = metrics
+
+            # Recompute health state with updated metrics
+            state, reason = _compute_agent_state(entry, now)
+            entry["state"] = state
+            entry["health_reason"] = reason
+            AGENTS[agent_name] = entry
 
     return {"status": "ok", "id": job_id}
 
