@@ -34,22 +34,48 @@ HEALTH_EVENTS: List[Dict[str, Any]] = []
 HEALTH_EVENTS_MAX = 500
 
 # -----------------------------------------------------------------------------
-# Agent health / autonomic thresholds
+# Agent health / autonomic thresholds (cluster-aware policy)
 # -----------------------------------------------------------------------------
 
-# How long an agent can go without a heartbeat before we call it "dead"
-DEAD_AGENT_THRESHOLD_S = 60.0
-
-# Latency / error thresholds for degraded classification
-DEGRADED_LATENCY_MS = 500.0       # above this, we start to worry
-DEGRADED_ERROR_RATE = 0.10        # >10% failures → degraded (if enough samples)
-
-# Auto-quarantine thresholds based on controller-observed metrics
-AUTO_QUARANTINE_ERROR_RATE = 0.50     # >50% failures → quarantine
-AUTO_QUARANTINE_MIN_TASKS = 10        # only quarantine if there's enough volume
-AUTO_QUARANTINE_MAX_TIMEOUTS = 5      # too many lease timeouts → quarantine
-
-SUSPECT_MIN_TASKS = 5                 # still used for degraded thresholding
+HEALTH_POLICY: Dict[str, Any] = {
+    # Heartbeat / liveness rules
+    "heartbeat": {
+        "suspect_age_sec": 40.0,
+        "dead_age_sec": 120.0,
+    },
+    # Behavior changes depending on cluster capacity
+    "modes": {
+        # Plenty of healthy workers → be aggressive about cutting bad nodes
+        "aggressive": {
+            "error_rate_suspect": 0.05,          # 5% errors → suspect
+            "error_rate_quarantine": 0.15,       # 15% errors → quarantine
+            "max_timeouts_quarantine": 5,        # timeouts → quarantine
+        },
+        # Few workers → tolerate more garbage to keep cluster usable
+        "conservative": {
+            "error_rate_suspect": 0.10,          # 10% errors → suspect
+            "error_rate_quarantine": 0.25,       # 25% errors → quarantine
+            "max_timeouts_quarantine": 8,
+        },
+    },
+    # Need at least this many tasks before we trust error-rate based decisions
+    "min_tasks_for_rate": 30,
+    # Auto-ban rules (hard fail)
+    "ban": {
+        "max_timeouts": 50,                      # many timeouts → ban
+        "max_error_rate": 0.40,                 # 40%+ error rate with enough volume → ban
+        "min_tasks": 200,
+    },
+    # Auto-recovery rules (out of suspect/quarantined back to healthy)
+    "recovery": {
+        "cooldown_sec": 60.0,                   # no failures for 60s
+        "max_error_rate": 0.02,                 # ≤2% error
+    },
+    # Latency thresholds
+    "latency_ms": {
+        "degraded": 500.0,                      # ≥500ms avg latency → degraded/suspect
+    },
+}
 
 # Metrics we accept from agents in heartbeat/register payloads
 AGENT_METRIC_KEYS = [
@@ -118,13 +144,48 @@ def _emit_health_event(
         del HEALTH_EVENTS[:overflow]
 
 
+def _cluster_policy_mode() -> str:
+    """
+    Decide whether we're in 'aggressive' or 'conservative' mode
+    based on overall cluster capacity and health.
+
+    Uses worker_profile.workers.max_total_workers if present; otherwise assumes 1 per agent.
+    """
+    total_workers = 0
+    healthy_workers = 0
+    healthy_agents = 0
+
+    for info in AGENTS.values():
+        wp = info.get("worker_profile") or {}
+        workers = wp.get("workers") or {}
+        try:
+            max_workers = int(workers.get("max_total_workers", 1) or 1)
+        except (TypeError, ValueError):
+            max_workers = 1
+
+        total_workers += max_workers
+
+        state = info.get("state") or "unknown"
+        if state == "healthy":
+            healthy_workers += max_workers
+            healthy_agents += 1
+
+    if total_workers == 0:
+        return "conservative"
+
+    healthy_ratio = healthy_workers / float(total_workers)
+    if healthy_ratio >= 0.7 and healthy_agents >= 5:
+        return "aggressive"
+    return "conservative"
+
+
 def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> (str, str):
     """
     Compute a health state for an agent based on:
-      - last_seen
-      - controller-observed metrics (ctrl_*)
-      - agent-reported metrics (fallback)
       - manual_state overrides (quarantined / banned)
+      - last_seen / heartbeat age
+      - controller-observed metrics (ctrl_*)
+      - cluster-wide policy mode (aggressive / conservative)
 
     Returns:
       (state, reason)
@@ -133,7 +194,9 @@ def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> (
     if now is None:
         now = _now()
 
-    # Manual override wins
+    policy = HEALTH_POLICY
+
+    # Manual override wins, always.
     manual_state = info.get("manual_state")
     manual_reason = info.get("manual_reason") or "manual_override"
     if manual_state == "quarantined":
@@ -145,8 +208,18 @@ def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> (
     if last_seen is None:
         return "unknown", "no_heartbeat_yet"
 
+    try:
+        last_seen_f = float(last_seen)
+    except (TypeError, ValueError):
+        last_seen_f = now
+
+    hb_conf = policy["heartbeat"]
+    dead_age = float(hb_conf["dead_age_sec"])
+    suspect_age = float(hb_conf["suspect_age_sec"])
+
     # Dead: missed heartbeat for too long
-    if now - float(last_seen) > DEAD_AGENT_THRESHOLD_S:
+    age = now - last_seen_f
+    if age > dead_age:
         return "dead", "missed_heartbeat"
 
     metrics = info.get("metrics") or {}
@@ -174,6 +247,8 @@ def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> (
     # Choose latency source
     latency_ms = ctrl_avg_latency_ms if ctrl_avg_latency_ms is not None else agent_latency_ms
 
+    # Baseline state
+    old_state = info.get("state") or "unknown"
     state = "healthy"
     reason = "normal"
 
@@ -181,25 +256,73 @@ def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> (
     if total_tasks > 0:
         error_rate = float(tasks_failed) / float(total_tasks)
 
-    # --- Auto-quarantine: too many errors / timeouts -------------------------
-    if total_tasks >= AUTO_QUARANTINE_MIN_TASKS and error_rate >= AUTO_QUARANTINE_ERROR_RATE:
-        return "quarantined", f"auto_quarantine_high_error_rate_{error_rate:.2f}"
-
-    if ctrl_timeouts >= AUTO_QUARANTINE_MAX_TIMEOUTS:
-        return "quarantined", f"auto_quarantine_lease_timeouts_{ctrl_timeouts}"
-
-    # --- Degraded: elevated error rate --------------------------------------
-    if total_tasks >= SUSPECT_MIN_TASKS and error_rate >= DEGRADED_ERROR_RATE:
+    # Heartbeat-based "suspect": too quiet, but not dead
+    if age > suspect_age and old_state == "healthy":
         state = "degraded"
-        reason = f"elevated_error_rate_{error_rate:.2f}"
+        reason = f"stale_heartbeat_{age:.1f}s"
 
-    # --- Degraded: high latency ---------------------------------------------
-    if latency_ms is not None and latency_ms >= DEGRADED_LATENCY_MS:
+    # Cluster-aware mode
+    mode = _cluster_policy_mode()
+    mode_cfg = policy["modes"][mode]
+    min_tasks = int(policy["min_tasks_for_rate"])
+
+    # --- Auto-ban rules ------------------------------------------------------
+    if total_tasks >= min_tasks:
+        ban_cfg = policy["ban"]
+        ban_min_tasks = int(ban_cfg["min_tasks"])
+        ban_max_err = float(ban_cfg["max_error_rate"])
+        ban_max_timeouts = int(ban_cfg["max_timeouts"])
+
+        if total_tasks >= ban_min_tasks and error_rate >= ban_max_err:
+            return "banned", f"auto_ban_error_rate_{error_rate:.2f}"
+
+        if ctrl_timeouts >= ban_max_timeouts:
+            return "banned", f"auto_ban_timeouts_{ctrl_timeouts}"
+
+    # --- Quarantine / suspect / degraded rules ------------------------------
+    if total_tasks >= min_tasks:
+        err_quar = float(mode_cfg["error_rate_quarantine"])
+        err_sus = float(mode_cfg["error_rate_suspect"])
+        max_timeouts_quar = int(mode_cfg["max_timeouts_quarantine"])
+
+        # Auto-quarantine: bad error rate or many timeouts
+        if error_rate >= err_quar or ctrl_timeouts >= max_timeouts_quar:
+            state = "quarantined"
+            reason = f"auto_quarantine_err={error_rate:.2f}_timeouts={ctrl_timeouts}"
+        # Suspect/degraded: elevated error rate
+        elif error_rate >= err_sus:
+            state = "degraded"
+            reason = f"elevated_error_rate_{error_rate:.2f}"
+
+    # --- Latency-based degraded ---------------------------------------------
+    lat_conf = policy["latency_ms"]
+    degraded_latency = float(lat_conf["degraded"])
+    if latency_ms is not None and float(latency_ms) >= degraded_latency:
         if state == "healthy":
             state = "degraded"
-            reason = f"high_latency_{latency_ms:.1f}ms"
+            reason = f"high_latency_{float(latency_ms):.1f}ms"
         else:
-            reason += f"_and_high_latency_{latency_ms:.1f}ms"
+            reason = f"{reason}_high_latency_{float(latency_ms):.1f}ms"
+
+    # --- Auto-recovery from degraded/quarantined ----------------------------
+    # Only for non-manual states (manual handled at top).
+    rec_cfg = policy["recovery"]
+    rec_cooldown = float(rec_cfg["cooldown_sec"])
+    rec_max_err = float(rec_cfg["max_error_rate"])
+
+    last_fail_ts = metrics.get("ctrl_last_failure_ts")
+    last_fail_age = None
+    if last_fail_ts is not None:
+        try:
+            last_fail_age = now - float(last_fail_ts)
+        except (TypeError, ValueError):
+            last_fail_age = None
+
+    if old_state in ("degraded", "quarantined"):
+        # If we've cooled down and error rate is low, let the agent redeem itself.
+        if error_rate <= rec_max_err and (last_fail_age is None or last_fail_age >= rec_cooldown):
+            state = "healthy"
+            reason = "recovered"
 
     return state, reason
 
@@ -224,7 +347,7 @@ def _set_agent_health(name: str, entry: Dict[str, Any], state: str, reason: str,
 
 def _refresh_agent_states(now: Optional[float] = None) -> None:
     """
-    Recompute health state for all agents.
+    Recompute health state for all agents using the current cluster policy mode.
     NOTE: Must be called with STATE_LOCK held.
     """
     if now is None:
@@ -839,7 +962,7 @@ async def post_result(request: Request) -> Dict[str, Any]:
 
             entry["metrics"] = metrics
 
-            # Recompute health state with updated metrics
+            # Recompute health state with updated metrics (cluster-aware)
             state, reason = _compute_agent_state(entry, now)
             _set_agent_health(agent_name, entry, state, reason, now)
 
