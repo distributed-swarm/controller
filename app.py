@@ -63,17 +63,17 @@ HEALTH_POLICY: Dict[str, Any] = {
     # Auto-ban rules (hard fail)
     "ban": {
         "max_timeouts": 50,                      # many timeouts → ban
-        "max_error_rate": 0.40,                 # 40%+ error rate with enough volume → ban
+        "max_error_rate": 0.40,                  # 40%+ error rate with enough volume → ban
         "min_tasks": 200,
     },
     # Auto-recovery rules (out of suspect/quarantined back to healthy)
     "recovery": {
-        "cooldown_sec": 60.0,                   # no failures for 60s
-        "max_error_rate": 0.02,                 # ≤2% error
+        "cooldown_sec": 60.0,                    # no failures for 60s
+        "max_error_rate": 0.02,                  # ≤2% error
     },
     # Latency thresholds
     "latency_ms": {
-        "degraded": 500.0,                      # ≥500ms avg latency → degraded/suspect
+        "degraded": 500.0,                       # ≥500ms avg latency → degraded/suspect
     },
 }
 
@@ -177,6 +177,44 @@ def _cluster_policy_mode() -> str:
     if healthy_ratio >= 0.7 and healthy_agents >= 5:
         return "aggressive"
     return "conservative"
+
+
+def _cluster_health_summary() -> Dict[str, Any]:
+    """
+    Aggregate view of cluster health for routing decisions.
+    Assumes STATE_LOCK is held when called.
+    """
+    total_workers = 0
+    healthy_workers = 0
+    degraded_workers = 0
+    healthy_agents = 0
+    degraded_agents = 0
+
+    for info in AGENTS.values():
+        wp = info.get("worker_profile") or {}
+        workers = wp.get("workers") or {}
+        try:
+            max_workers = int(workers.get("max_total_workers", 1) or 1)
+        except (TypeError, ValueError):
+            max_workers = 1
+
+        total_workers += max_workers
+        state = info.get("state") or "unknown"
+
+        if state == "healthy":
+            healthy_workers += max_workers
+            healthy_agents += 1
+        elif state == "degraded":
+            degraded_workers += max_workers
+            degraded_agents += 1
+
+    return {
+        "total_workers": total_workers,
+        "healthy_workers": healthy_workers,
+        "degraded_workers": degraded_workers,
+        "healthy_agents": healthy_agents,
+        "degraded_agents": degraded_agents,
+    }
 
 
 def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> (str, str):
@@ -770,6 +808,9 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
 
     Health-aware behavior:
       - Agents in state dead / quarantined / banned will receive no work.
+      - Degraded agents:
+          • In aggressive mode: only used if there are no healthy workers.
+          • In conservative mode: still used, but health is tracked separately.
 
     GPU-aware behavior:
       - If job payload has {"prefer_gpu": true, "min_vram_gb": X}
@@ -790,6 +831,17 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
     # Hard block for obviously bad states
     if agent_state in ("dead", "quarantined", "banned"):
         return None
+
+    # Cluster-mode-aware throttling for degraded agents
+    mode = _cluster_policy_mode()
+    summary = _cluster_health_summary()
+
+    if agent_state == "degraded":
+        # In aggressive mode, if we still have healthy worker capacity,
+        # keep degraded agents idle and let healthy nodes take the work.
+        if mode == "aggressive" and summary["healthy_workers"] > 0:
+            return None
+        # In conservative mode or if no healthy workers, we let them work.
 
     wp = agent_info.get("worker_profile") or {}
     gpu = wp.get("gpu") or {}
