@@ -447,10 +447,6 @@ async def _lease_reaper_loop(interval_s: float = 1.0) -> None:
                     TASK_QUEUE.append(job_id)
                     reclaimed += 1
 
-        # Uncomment if you want spammy logs:
-        # if reclaimed:
-        #     print(f"[reaper] reclaimed {reclaimed} jobs this tick")
-
         await asyncio.sleep(interval_s)
 
 
@@ -521,11 +517,15 @@ async def register_agent(request: Request) -> Dict[str, Any]:
 
     now = _now()
 
-    # Extract optional metrics from payload
+    # Extract optional metrics from payload.
+    # Accept both top-level fields and nested under "metrics".
     metrics: Dict[str, Any] = {}
+    nested_metrics = payload.get("metrics") or {}
     for key in AGENT_METRIC_KEYS:
         if key in payload:
             metrics[key] = payload.get(key)
+        elif key in nested_metrics:
+            metrics[key] = nested_metrics.get(key)
 
     with STATE_LOCK:
         info: Dict[str, Any] = {
@@ -571,11 +571,15 @@ async def agent_heartbeat(request: Request) -> Dict[str, Any]:
 
     now = _now()
 
-    # Extract optional metrics from payload
+    # Extract optional metrics from payload.
+    # Accept both top-level fields and nested under "metrics".
     metrics_update: Dict[str, Any] = {}
+    nested_metrics = payload.get("metrics") or {}
     for key in AGENT_METRIC_KEYS:
         if key in payload:
             metrics_update[key] = payload.get(key)
+        elif key in nested_metrics:
+            metrics_update[key] = nested_metrics.get(key)
 
     with STATE_LOCK:
         entry = AGENTS.get(name, {})
