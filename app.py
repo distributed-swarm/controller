@@ -1026,8 +1026,77 @@ async def post_result(request: Request) -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# Jobs / results inspection
+# Jobs / results inspection & submission
 # -----------------------------------------------------------------------------
+
+@app.post("/job")
+@app.post("/api/job")
+async def submit_job(request: Request) -> Dict[str, Any]:
+    """
+    Generic job submission endpoint.
+
+    Supports two shapes:
+
+    1) Single job:
+       {
+         "op": "map_tokenize",
+         "payload": { ... }
+       }
+
+    2) Batch/map jobs (e.g. map_summarize):
+       {
+         "op": "map_summarize",
+         "items": [
+           {"id": "doc-001", "text": "..."},
+           {"id": "doc-002", "text": "..."}
+         ],
+         "params": { ... },
+         "shard_size": 1   # optional, default 1 item per job
+       }
+
+    In batch mode, each shard becomes one job with payload:
+       { "items": [...], "params": {...} }
+    """
+    body = await request.json()
+    op = body.get("op")
+    if not op:
+        raise HTTPException(status_code=400, detail="Missing 'op'")
+
+    items = body.get("items")
+    params = body.get("params") or {}
+    shard_size_raw = body.get("shard_size")
+    payload_single = body.get("payload") or {}
+
+    job_ids: List[str] = []
+
+    with STATE_LOCK:
+        # Batch/map mode: items present and non-empty
+        if isinstance(items, list) and items:
+            try:
+                shard_size = int(shard_size_raw) if shard_size_raw is not None else 1
+            except (TypeError, ValueError):
+                shard_size = 1
+            if shard_size < 1:
+                shard_size = 1
+
+            for i in range(0, len(items), shard_size):
+                shard_items = items[i : i + shard_size]
+                job_payload = {
+                    "items": shard_items,
+                    "params": params,
+                }
+                job_ids.append(_enqueue_job(op, job_payload))
+        else:
+            # Single job mode
+            job_ids.append(_enqueue_job(op, payload_single))
+
+    return {
+        "status": "ok",
+        "op": op,
+        "count": len(job_ids),
+        "job_ids": job_ids,
+    }
+
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str) -> Dict[str, Any]:
@@ -1210,6 +1279,14 @@ def stats_ops() -> Dict[str, Any]:
 async def seed(request: Request) -> Dict[str, Any]:
     """
     Seed some demo jobs, mostly for smoke tests.
+
+    Body shape (classic mode):
+
+      {
+        "count": 10,
+        "op": "map_tokenize",
+        "payload_template": { "text": "The quick brown fox..." }
+      }
     """
     payload = await request.json()
     count = int(payload.get("count", 10))
