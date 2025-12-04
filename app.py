@@ -779,11 +779,24 @@ def get_task(agent: str, wait_ms: int = 0):
         time.sleep(0.05)
 
 
-def _enqueue_job(op: str, payload: Dict[str, Any]) -> str:
+def _enqueue_job(op: str, payload: Dict[str, Any], custom_timeout: Optional[int] = None) -> str:
     """
     Enqueue a job and return its ID.
+    Now supports dynamic timeouts for heavy AI tasks.
     """
     global JOBS, TASK_QUEUE
+
+    # --- CONFIGURABLE DEFAULTS ---
+    # Standard task: 5 minutes
+    default_timeout = 300 
+    
+    # Heavy AI task (Summarization, Transcription): 20 minutes
+    if op in ("map_summarize", "transcribe_audio", "generate_image"):
+        default_timeout = 1200 
+
+    # Allow caller to override
+    timeout_s = custom_timeout if custom_timeout is not None else default_timeout
+    # -----------------------------
 
     job_id = str(uuid.uuid4())
     job = {
@@ -793,8 +806,8 @@ def _enqueue_job(op: str, payload: Dict[str, Any]) -> str:
         "created_ts": _now(),
         "leased_ts": None,
         "leased_by": None,
-        # Lease timeout in seconds; used by _lease_reaper_loop
-        "lease_timeout_s": 300,
+        # Use the dynamic timeout
+        "lease_timeout_s": timeout_s, 
         "status": "queued",  # queued | leased | completed | failed
         "result": None,
         "error": None,
@@ -1010,317 +1023,4 @@ async def post_result(request: Request) -> Dict[str, Any]:
                     "ctrl_tasks_failed": ctrl_failed,
                     "ctrl_error_rate": error_rate,
                     "ctrl_avg_latency_ms": new_avg,
-                    "ctrl_latency_samples": new_n,
-                }
-            )
-            if not ok:
-                metrics["ctrl_last_failure_ts"] = now
-
-            entry["metrics"] = metrics
-
-            # Recompute health state with updated metrics (cluster-aware)
-            state, reason = _compute_agent_state(entry, now)
-            _set_agent_health(agent_name, entry, state, reason, now)
-
-    return {"status": "ok", "id": job_id}
-
-
-# -----------------------------------------------------------------------------
-# Jobs / results inspection & submission
-# -----------------------------------------------------------------------------
-
-@app.post("/job")
-@app.post("/api/job")
-async def submit_job(request: Request) -> Dict[str, Any]:
-    """
-    Generic job submission endpoint.
-
-    Supports two shapes:
-
-    1) Single job:
-       {
-         "op": "map_tokenize",
-         "payload": { ... }
-       }
-
-    2) Batch/map jobs (e.g. map_summarize):
-       {
-         "op": "map_summarize",
-         "items": [
-           {"id": "doc-001", "text": "..."},
-           {"id": "doc-002", "text": "..."}
-         ],
-         "params": { ... },
-         "shard_size": 1   # optional, default 1 item per job
-       }
-
-    In batch mode, each shard becomes one job with payload:
-       { "items": [...], "params": {...} }
-    """
-    body = await request.json()
-    op = body.get("op")
-    if not op:
-        raise HTTPException(status_code=400, detail="Missing 'op'")
-
-    items = body.get("items")
-    params = body.get("params") or {}
-    shard_size_raw = body.get("shard_size")
-    payload_single = body.get("payload") or {}
-
-    job_ids: List[str] = []
-
-    with STATE_LOCK:
-        # Batch/map mode: items present and non-empty
-        if isinstance(items, list) and items:
-            try:
-                shard_size = int(shard_size_raw) if shard_size_raw is not None else 1
-            except (TypeError, ValueError):
-                shard_size = 1
-            if shard_size < 1:
-                shard_size = 1
-
-            for i in range(0, len(items), shard_size):
-                shard_items = items[i : i + shard_size]
-                job_payload = {
-                    "items": shard_items,
-                    "params": params,
-                }
-                job_ids.append(_enqueue_job(op, job_payload))
-        else:
-            # Single job mode
-            job_ids.append(_enqueue_job(op, payload_single))
-
-    return {
-        "status": "ok",
-        "op": op,
-        "count": len(job_ids),
-        "job_ids": job_ids,
-    }
-
-
-@app.get("/jobs/{job_id}")
-def get_job(job_id: str) -> Dict[str, Any]:
-    with STATE_LOCK:
-        job = JOBS.get(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="Unknown job id")
-        return job
-
-
-@app.get("/results")
-def list_results(limit: int = 100) -> List[Dict[str, Any]]:
-    """Recent finished jobs."""
-    with STATE_LOCK:
-        finished = [
-            j
-            for j in JOBS.values()
-            if j.get("status") in ("completed", "failed")
-        ]
-        finished.sort(key=lambda j: j.get("completed_ts") or 0.0, reverse=True)
-        return finished[:limit]
-
-
-@app.get("/timeline")
-def timeline(limit: int = 200) -> List[Dict[str, Any]]:
-    """Timeline of jobs by created_ts."""
-    with STATE_LOCK:
-        jobs = list(JOBS.values())
-        jobs.sort(key=lambda j: j.get("created_ts") or 0.0)
-        return jobs[-limit:]
-
-
-# -----------------------------------------------------------------------------
-# Stats / metrics for UI
-# -----------------------------------------------------------------------------
-
-def _calc_rate(window_s: float, now: Optional[float] = None) -> float:
-    """Tasks/sec over the last window_s seconds."""
-    if window_s <= 0:
-        return 0.0
-    if now is None:
-        now = _now()
-    cutoff = now - window_s
-    _prune_completion_times(now)
-    count = sum(1 for t in COMPLETION_TIMES if t >= cutoff)
-    return count / window_s if count > 0 else 0.0
-
-
-@app.get("/stats")
-def stats() -> Dict[str, Any]:
-    """
-    Summary stats for the UI.
-
-    Includes:
-      - agent_states: counts by health state
-      - gpu_agents_online: number of agents with gpu_present == True
-      - total_gpu_vram_gb: sum of vram_gb over gpu agents
-    """
-    now = _now()
-    with STATE_LOCK:
-        _refresh_agent_states(now)
-
-        agents_online = len(AGENTS)
-        queue_len = len(TASK_QUEUE)
-        leased_total = LEASED_TOTAL
-        completed_total = COMPLETED_TOTAL
-        failed_total = FAILED_TOTAL
-
-        _prune_completion_times(now)
-
-        rate_1s = _calc_rate(1.0, now)
-        rate_60s = _calc_rate(60.0, now)
-        rate_5m = _calc_rate(300.0, now)
-        rate_15m = _calc_rate(900.0, now)
-
-        op_counts = dict(OP_COUNTS)
-        op_avg_ms = {
-            op: (OP_TOTAL_MS[op] / count) if count > 0 else 0.0
-            for op, count in OP_COUNTS.items()
-        }
-
-        agent_states: Dict[str, int] = defaultdict(int)
-        gpu_agents_online = 0
-        total_gpu_vram_gb = 0.0
-
-        for info in AGENTS.values():
-            state = info.get("state") or "unknown"
-            agent_states[state] += 1
-
-            wp = info.get("worker_profile") or {}
-            if isinstance(wp, dict):
-                gpu = wp.get("gpu") or {}
-            else:
-                gpu = {}
-
-            gpu_present = bool(gpu.get("gpu_present"))
-            if gpu_present:
-                gpu_agents_online += 1
-                try:
-                    vram = float(gpu.get("vram_gb", 0) or 0)
-                except (TypeError, ValueError):
-                    vram = 0.0
-                total_gpu_vram_gb += vram
-
-    return {
-        "time": now,
-        "agents_online": agents_online,
-        "queue_len": queue_len,
-        "leased_total": leased_total,
-        "completed_total": completed_total,
-        "failed_total": failed_total,
-        "rate_1s": rate_1s,
-        "rate_60s": rate_60s,
-        "rate_5m": rate_5m,
-        "rate_15m": rate_15m,
-        "op_counts": op_counts,
-        "op_avg_ms": op_avg_ms,
-        "agent_states": dict(agent_states),
-        "gpu_agents_online": gpu_agents_online,
-        "total_gpu_vram_gb": total_gpu_vram_gb,
-    }
-
-
-@app.get("/stats/sparkline")
-def stats_sparkline() -> Dict[str, Any]:
-    """
-    Tiny sparkline-friendly throughput series over the last 15 minutes.
-    """
-    now = _now()
-    window_s = 900.0
-    bucket_s = 10.0
-
-    with STATE_LOCK:
-        _prune_completion_times(now, window_s)
-        times = list(COMPLETION_TIMES)
-
-    if not times:
-        return {"buckets": [], "values": []}
-
-    start = now - window_s
-    num_buckets = int(window_s / bucket_s)
-    buckets = [start + i * bucket_s for i in range(num_buckets)]
-    counts = [0] * num_buckets
-
-    for t in times:
-        idx = int((t - start) / bucket_s)
-        if 0 <= idx < num_buckets:
-            counts[idx] += 1
-
-    return {
-        "buckets": buckets,
-        "values": counts,
-    }
-
-
-@app.get("/stats/ops")
-def stats_ops() -> Dict[str, Any]:
-    """
-    Per-op stats for the UI: counts and average ms.
-    """
-    with STATE_LOCK:
-        op_counts = dict(OP_COUNTS)
-        op_avg_ms = {
-            op: (OP_TOTAL_MS[op] / count) if count > 0 else 0.0
-            for op, count in OP_COUNTS.items()
-        }
-
-    return {
-        "op_counts": op_counts,
-        "op_avg_ms": op_avg_ms,
-    }
-
-
-# -----------------------------------------------------------------------------
-# Seeding / purge
-# -----------------------------------------------------------------------------
-
-@app.post("/seed")
-@app.post("/api/seed")
-async def seed(request: Request) -> Dict[str, Any]:
-    """
-    Seed some demo jobs, mostly for smoke tests.
-
-    Body shape (classic mode):
-
-      {
-        "count": 10,
-        "op": "map_tokenize",
-        "payload_template": { "text": "The quick brown fox..." }
-      }
-    """
-    payload = await request.json()
-    count = int(payload.get("count", 10))
-    op = payload.get("op", "map_tokenize")
-    template = payload.get("payload_template") or {
-        "text": "The quick brown fox jumps over the lazy dog."
-    }
-
-    job_ids = []
-    with STATE_LOCK:
-        for _ in range(count):
-            body = dict(template)
-            body["ts"] = _now()
-            job_ids.append(_enqueue_job(op, body))
-
-    return {"status": "ok", "count": count, "op": op, "job_ids": job_ids}
-
-
-@app.post("/purge")
-def purge() -> Dict[str, Any]:
-    """
-    Blow away all jobs and reset counters. Useful when you want a clean run.
-    """
-    global JOBS, TASK_QUEUE, LEASED_TOTAL, COMPLETED_TOTAL, FAILED_TOTAL
-    global COMPLETION_TIMES, OP_COUNTS, OP_TOTAL_MS
-
-    with STATE_LOCK:
-        JOBS = {}
-        TASK_QUEUE = deque()
-        LEASED_TOTAL = 0
-        COMPLETED_TOTAL = 0
-        FAILED_TOTAL = 0
-        COMPLETION_TIMES = []
-        OP_COUNTS = defaultdict(int)
-        OP_TOTAL_MS = defaultdict(float)
-
-    return {"status": "ok", "message": "purged"}
+                    "ctrl_latency_
