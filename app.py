@@ -2,6 +2,7 @@ import asyncio
 import time
 import uuid
 import threading
+import json
 from collections import deque, defaultdict
 from typing import Any, Deque, Dict, List, Optional
 
@@ -86,6 +87,15 @@ AGENT_METRIC_KEYS = [
     "avg_task_ms",     # moving average duration
     "latency_ms",      # observed round-trip latency
 ]
+
+# Ops we treat as heavy and avoid scheduling on ultra-lite agents
+HEAVY_OPS = {
+    "map_summarize",
+    "transcribe_audio",
+    "generate_image",
+    "train_lora",
+    "train_model",
+}
 
 
 def _now() -> float:
@@ -409,7 +419,6 @@ async def _lease_reaper_loop(interval_s: float = 1.0) -> None:
     """
     while True:
         now = _now()
-        reclaimed = 0
 
         with STATE_LOCK:
             for job_id, job in list(JOBS.items()):
@@ -445,7 +454,6 @@ async def _lease_reaper_loop(interval_s: float = 1.0) -> None:
                     job["leased_ts"] = None
                     job["leased_by"] = None
                     TASK_QUEUE.append(job_id)
-                    reclaimed += 1
 
         await asyncio.sleep(interval_s)
 
@@ -747,6 +755,29 @@ def clear_events() -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
+# Helpers for task leasing
+# -----------------------------------------------------------------------------
+
+def _estimate_payload_bytes(payload: Any) -> int:
+    """
+    Roughly estimate the size in bytes of a payload.
+
+    Used to decide whether an agent with worker_profile.limits.max_payload_bytes
+    should be allowed to lease a given job.
+    """
+    if payload is None:
+        return 0
+
+    try:
+        return len(json.dumps(payload))
+    except Exception:
+        try:
+            return len(str(payload))
+        except Exception:
+            return 0
+
+
+# -----------------------------------------------------------------------------
 # Task leasing
 # -----------------------------------------------------------------------------
 
@@ -755,28 +786,30 @@ def clear_events() -> Dict[str, Any]:
     "/api/task",
     summary="Agent polls for next task",
 )
-def get_task(agent: str, wait_ms: int = 0):
+async def get_task(agent: str, wait_ms: int = 0):
     """
-    GET /task?agent=agent-1&wait_ms=1000
+    Non-blocking long-poll endpoint for agents.
 
-    Returns:
-      200 + JSON task if available
-      204 if none available before wait_ms
+    - Fast path: try once immediately.
+    - Slow path: loop with await asyncio.sleep, so we don't burn threads.
     """
     deadline = _now() + (wait_ms / 1000.0)
 
-    # Simple long-poll loop
-    while True:
+    # Fast path: immediate attempt
+    with STATE_LOCK:
+        task = _lease_next_job(agent)
+    if task is not None:
+        return JSONResponse(task)
+
+    # Slow path: wait until deadline, yielding to event loop each step
+    while _now() < deadline:
+        await asyncio.sleep(0.05)
         with STATE_LOCK:
             task = _lease_next_job(agent)
-
         if task is not None:
             return JSONResponse(task)
 
-        if _now() >= deadline:
-            return Response(status_code=204)
-
-        time.sleep(0.05)
+    return Response(status_code=204)
 
 
 def _enqueue_job(op: str, payload: Dict[str, Any], custom_timeout: Optional[int] = None) -> str:
@@ -788,11 +821,11 @@ def _enqueue_job(op: str, payload: Dict[str, Any], custom_timeout: Optional[int]
 
     # --- CONFIGURABLE DEFAULTS ---
     # Standard task: 5 minutes
-    default_timeout = 300 
-    
-    # Heavy AI task (Summarization, Transcription): 20 minutes
+    default_timeout = 300
+
+    # Heavy AI task (Summarization, Transcription, Image gen): 20 minutes
     if op in ("map_summarize", "transcribe_audio", "generate_image"):
-        default_timeout = 1200 
+        default_timeout = 1200
 
     # Allow caller to override
     timeout_s = custom_timeout if custom_timeout is not None else default_timeout
@@ -806,9 +839,8 @@ def _enqueue_job(op: str, payload: Dict[str, Any], custom_timeout: Optional[int]
         "created_ts": _now(),
         "leased_ts": None,
         "leased_by": None,
-        # Use the dynamic timeout
-        "lease_timeout_s": timeout_s, 
-        "status": "queued",  # queued | leased | completed | failed
+        "lease_timeout_s": timeout_s,  # dynamic timeout
+        "status": "queued",            # queued | leased | completed | failed
         "result": None,
         "error": None,
         "completed_ts": None,
@@ -829,19 +861,22 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
           • In aggressive mode: only used if there are no healthy workers.
           • In conservative mode: still used, but health is tracked separately.
 
-    GPU-aware behavior:
+    GPU- and tier-aware behavior:
       - If job payload has {"prefer_gpu": true, "min_vram_gb": X}
         then only agents with gpu_present == True and vram_gb >= X
         are allowed to take it.
-      - Non-qualifying agents skip those jobs (requeued at tail),
-        but we only scan each queued job once per call to avoid
-        infinite loops for CPU agents.
+      - Jobs whose op is in HEAVY_OPS will not be scheduled on ultra-lite agents.
+      - Jobs whose estimated payload size exceeds worker_profile.limits.max_payload_bytes
+        are not leased to that agent.
+
+      Non-qualifying agents skip those jobs (requeued at tail),
+      but we only scan each queued job once per call to avoid infinite loops.
     """
     global LEASED_TOTAL
 
     now = _now()
 
-    # Look up this agent's health + GPU capabilities
+    # Look up this agent's health + capabilities
     agent_info = AGENTS.get(agent) or {}
     agent_state = agent_info.get("state") or "unknown"
 
@@ -862,12 +897,16 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
 
     wp = agent_info.get("worker_profile") or {}
     gpu = wp.get("gpu") or {}
+    limits = wp.get("limits") or {}
+    tier = wp.get("tier") or "default"
 
     agent_has_gpu = bool(gpu.get("gpu_present"))
     try:
         agent_vram_gb = float(gpu.get("vram_gb", 0) or 0)
     except (TypeError, ValueError):
         agent_vram_gb = 0.0
+
+    max_payload_bytes = limits.get("max_payload_bytes")
 
     # Snapshot queue length so we only inspect each job once
     queue_len = len(TASK_QUEUE)
@@ -885,6 +924,7 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
             continue
 
         payload = job.get("payload") or {}
+        op = job.get("op") or "unknown"
 
         prefer_gpu = bool(payload.get("prefer_gpu", False))
 
@@ -897,6 +937,24 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
         # If the job prefers GPU and this agent doesn't qualify, requeue & skip
         if prefer_gpu:
             if (not agent_has_gpu) or (agent_vram_gb < min_vram_gb):
+                TASK_QUEUE.append(job_id)
+                continue
+
+        # Avoid scheduling heavy ops on ultra-lite agents
+        if op in HEAVY_OPS and tier == "ultra-lite":
+            TASK_QUEUE.append(job_id)
+            continue
+
+        # Enforce payload size limits for agents that declare them
+        if max_payload_bytes is not None:
+            approx_bytes = _estimate_payload_bytes(payload)
+            try:
+                max_bytes_int = int(max_payload_bytes)
+            except (TypeError, ValueError):
+                max_bytes_int = None
+
+            if max_bytes_int is not None and approx_bytes > max_bytes_int:
+                # Too big for this agent; requeue for someone else
                 TASK_QUEUE.append(job_id)
                 continue
 
@@ -1080,9 +1138,8 @@ async def submit_job(request: Request) -> Dict[str, Any]:
     shard_size_raw = body.get("shard_size")
     payload_single = body.get("payload") or {}
 
-    # Check if the client requested a specific timeout override
-    # e.g. {"op": "map_summarize", "timeout_s": 1800, ...}
-    requested_timeout = body.get("timeout_s") 
+    # Optional timeout override: {"op": "map_summarize", "timeout_s": 1800}
+    requested_timeout = body.get("timeout_s")
 
     job_ids: List[str] = []
 
@@ -1097,7 +1154,7 @@ async def submit_job(request: Request) -> Dict[str, Any]:
                 shard_size = 1
 
             for i in range(0, len(items), shard_size):
-                shard_items = items[i : i + shard_size]
+                shard_items = items[i: i + shard_size]
                 job_payload = {
                     "items": shard_items,
                     "params": params,
