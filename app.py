@@ -10,6 +10,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
 from starlette.responses import Response
 
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    print("Core System: UVLOOP Enabled (High Performance Mode)")
+except ImportError:
+    print("Core System: UVLOOP Not Found (Standard Mode)")
+    
 app = FastAPI(title="Distributed Swarm Controller")
 
 # -----------------------------------------------------------------------------
