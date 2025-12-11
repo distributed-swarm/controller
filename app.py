@@ -18,7 +18,16 @@ try:
 except ImportError:
     print("Core System: UVLOOP Not Found (Standard Mode)")
     
-app = FastAPI(title="Distributed Swarm Controller")
+app = FastAPI(title="Neuro-Fabric Controller")
+
+# Allow the UI (Vite frontend) to talk to the controller
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],      # allow your UI during development
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # -----------------------------------------------------------------------------
 # In-memory state
