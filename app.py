@@ -9,6 +9,7 @@ from typing import Any, Deque, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
 from starlette.responses import Response
+from fastapi.middleware.cors import CORSMiddleware
 
 try:
     import uvloop
