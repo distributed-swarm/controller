@@ -2,32 +2,17 @@ import asyncio
 import time
 import uuid
 import threading
-import json
 from collections import deque, defaultdict
 from typing import Any, Deque, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
 from starlette.responses import Response
-from fastapi.middleware.cors import CORSMiddleware
 
-try:
-    import uvloop
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    print("Core System: UVLOOP Enabled (High Performance Mode)")
-except ImportError:
-    print("Core System: UVLOOP Not Found (Standard Mode)")
-    
-app = FastAPI(title="Neuro-Fabric Controller")
+from pipelines.engine import run_text_pipeline
+from pipelines.spec import IntakeRequest
 
-# Allow the UI (Vite frontend) to talk to the controller
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],      # allow your UI during development
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="Distributed Swarm Controller")
 
 # -----------------------------------------------------------------------------
 # In-memory state
@@ -38,6 +23,9 @@ STATE_LOCK = threading.Lock()
 AGENTS: Dict[str, Dict[str, Any]] = {}
 JOBS: Dict[str, Dict[str, Any]] = {}
 TASK_QUEUE: Deque[str] = deque()
+
+# Pipeline runs (digestion layer) tracked in-memory for now
+PIPELINES: Dict[str, Dict[str, Any]] = {}
 
 LEASED_TOTAL = 0
 COMPLETED_TOTAL = 0
@@ -104,15 +92,6 @@ AGENT_METRIC_KEYS = [
     "avg_task_ms",     # moving average duration
     "latency_ms",      # observed round-trip latency
 ]
-
-# Ops we treat as heavy and avoid scheduling on ultra-lite agents
-HEAVY_OPS = {
-    "map_summarize",
-    "transcribe_audio",
-    "generate_image",
-    "train_lora",
-    "train_model",
-}
 
 
 def _now() -> float:
@@ -436,6 +415,7 @@ async def _lease_reaper_loop(interval_s: float = 1.0) -> None:
     """
     while True:
         now = _now()
+        reclaimed = 0
 
         with STATE_LOCK:
             for job_id, job in list(JOBS.items()):
@@ -471,6 +451,7 @@ async def _lease_reaper_loop(interval_s: float = 1.0) -> None:
                     job["leased_ts"] = None
                     job["leased_by"] = None
                     TASK_QUEUE.append(job_id)
+                    reclaimed += 1
 
         await asyncio.sleep(interval_s)
 
@@ -772,29 +753,6 @@ def clear_events() -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# Helpers for task leasing
-# -----------------------------------------------------------------------------
-
-def _estimate_payload_bytes(payload: Any) -> int:
-    """
-    Roughly estimate the size in bytes of a payload.
-
-    Used to decide whether an agent with worker_profile.limits.max_payload_bytes
-    should be allowed to lease a given job.
-    """
-    if payload is None:
-        return 0
-
-    try:
-        return len(json.dumps(payload))
-    except Exception:
-        try:
-            return len(str(payload))
-        except Exception:
-            return 0
-
-
-# -----------------------------------------------------------------------------
 # Task leasing
 # -----------------------------------------------------------------------------
 
@@ -803,50 +761,35 @@ def _estimate_payload_bytes(payload: Any) -> int:
     "/api/task",
     summary="Agent polls for next task",
 )
-async def get_task(agent: str, wait_ms: int = 0):
+def get_task(agent: str, wait_ms: int = 0):
     """
-    Non-blocking long-poll endpoint for agents.
+    GET /task?agent=agent-1&wait_ms=1000
 
-    - Fast path: try once immediately.
-    - Slow path: loop with await asyncio.sleep, so we don't burn threads.
+    Returns:
+      200 + JSON task if available
+      204 if none available before wait_ms
     """
     deadline = _now() + (wait_ms / 1000.0)
 
-    # Fast path: immediate attempt
-    with STATE_LOCK:
-        task = _lease_next_job(agent)
-    if task is not None:
-        return JSONResponse(task)
-
-    # Slow path: wait until deadline, yielding to event loop each step
-    while _now() < deadline:
-        await asyncio.sleep(0.05)
+    # Simple long-poll loop
+    while True:
         with STATE_LOCK:
             task = _lease_next_job(agent)
+
         if task is not None:
             return JSONResponse(task)
 
-    return Response(status_code=204)
+        if _now() >= deadline:
+            return Response(status_code=204)
+
+        time.sleep(0.05)
 
 
-def _enqueue_job(op: str, payload: Dict[str, Any], custom_timeout: Optional[int] = None) -> str:
+def _enqueue_job(op: str, payload: Dict[str, Any]) -> str:
     """
     Enqueue a job and return its ID.
-    Now supports dynamic timeouts for heavy AI tasks.
     """
     global JOBS, TASK_QUEUE
-
-    # --- CONFIGURABLE DEFAULTS ---
-    # Standard task: 5 minutes
-    default_timeout = 300
-
-    # Heavy AI task (Summarization, Transcription, Image gen): 20 minutes
-    if op in ("map_summarize", "transcribe_audio", "generate_image"):
-        default_timeout = 1200
-
-    # Allow caller to override
-    timeout_s = custom_timeout if custom_timeout is not None else default_timeout
-    # -----------------------------
 
     job_id = str(uuid.uuid4())
     job = {
@@ -856,8 +799,9 @@ def _enqueue_job(op: str, payload: Dict[str, Any], custom_timeout: Optional[int]
         "created_ts": _now(),
         "leased_ts": None,
         "leased_by": None,
-        "lease_timeout_s": timeout_s,  # dynamic timeout
-        "status": "queued",            # queued | leased | completed | failed
+        # Lease timeout in seconds; used by _lease_reaper_loop
+        "lease_timeout_s": 300,
+        "status": "queued",  # queued | leased | completed | failed
         "result": None,
         "error": None,
         "completed_ts": None,
@@ -878,59 +822,32 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
           • In aggressive mode: only used if there are no healthy workers.
           • In conservative mode: still used, but health is tracked separately.
 
-    GPU- and tier-aware behavior:
+    GPU-aware behavior:
       - If job payload has {"prefer_gpu": true, "min_vram_gb": X}
-        then only agents with gpu_present == True and vram_gb >= X
-        are allowed to take it.
-      - Jobs whose op is in HEAVY_OPS will not be scheduled on ultra-lite agents.
-      - Jobs whose estimated payload size exceeds worker_profile.limits.max_payload_bytes
-        are not leased to that agent.
-
-      Non-qualifying agents skip those jobs (requeued at tail),
-      but we only scan each queued job once per call to avoid infinite loops.
+        then only agents with gpu_present and vram_gb>=X will receive it.
     """
     global LEASED_TOTAL
 
     now = _now()
-
-    # Look up this agent's health + capabilities
     agent_info = AGENTS.get(agent) or {}
-    agent_state = agent_info.get("state") or "unknown"
+    state = agent_info.get("state") or "unknown"
 
-    # Hard block for obviously bad states
-    if agent_state in ("dead", "quarantined", "banned"):
+    # Hard stops
+    if state in ("dead", "quarantined", "banned"):
         return None
 
-    # Cluster-mode-aware throttling for degraded agents
+    # In aggressive mode, only use degraded agents if there are no healthy workers.
     mode = _cluster_policy_mode()
-    summary = _cluster_health_summary()
-
-    if agent_state == "degraded":
-        # In aggressive mode, if we still have healthy worker capacity,
-        # keep degraded agents idle and let healthy nodes take the work.
-        if mode == "aggressive" and summary["healthy_workers"] > 0:
+    if state == "degraded" and mode == "aggressive":
+        summary = _cluster_health_summary()
+        if summary.get("healthy_workers", 0) > 0:
             return None
-        # In conservative mode or if no healthy workers, we let them work.
 
-    wp = agent_info.get("worker_profile") or {}
-    gpu = wp.get("gpu") or {}
-    limits = wp.get("limits") or {}
-    tier = wp.get("tier") or "default"
-
-    agent_has_gpu = bool(gpu.get("gpu_present"))
-    try:
-        agent_vram_gb = float(gpu.get("vram_gb", 0) or 0)
-    except (TypeError, ValueError):
-        agent_vram_gb = 0.0
-
-    max_payload_bytes = limits.get("max_payload_bytes")
-
-    # Snapshot queue length so we only inspect each job once
+    # Pop a job and validate GPU constraints / health constraints
     queue_len = len(TASK_QUEUE)
-
     for _ in range(queue_len):
         if not TASK_QUEUE:
-            break
+            return None
 
         job_id = TASK_QUEUE.popleft()
         job = JOBS.get(job_id)
@@ -941,39 +858,27 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
             continue
 
         payload = job.get("payload") or {}
-        op = job.get("op") or "unknown"
-
         prefer_gpu = bool(payload.get("prefer_gpu", False))
+        min_vram_gb = payload.get("min_vram_gb")
 
-        min_vram_gb_raw = payload.get("min_vram_gb")
-        try:
-            min_vram_gb = float(min_vram_gb_raw) if min_vram_gb_raw is not None else 0.0
-        except (TypeError, ValueError):
-            min_vram_gb = 0.0
-
-        # If the job prefers GPU and this agent doesn't qualify, requeue & skip
         if prefer_gpu:
-            if (not agent_has_gpu) or (agent_vram_gb < min_vram_gb):
+            wp = agent_info.get("worker_profile") or {}
+            gpu = wp.get("gpu") or {}
+            gpu_present = bool(gpu.get("gpu_present", False))
+            if not gpu_present:
                 TASK_QUEUE.append(job_id)
                 continue
 
-        # Avoid scheduling heavy ops on ultra-lite agents
-        if op in HEAVY_OPS and tier == "ultra-lite":
-            TASK_QUEUE.append(job_id)
-            continue
-
-        # Enforce payload size limits for agents that declare them
-        if max_payload_bytes is not None:
-            approx_bytes = _estimate_payload_bytes(payload)
-            try:
-                max_bytes_int = int(max_payload_bytes)
-            except (TypeError, ValueError):
-                max_bytes_int = None
-
-            if max_bytes_int is not None and approx_bytes > max_bytes_int:
-                # Too big for this agent; requeue for someone else
-                TASK_QUEUE.append(job_id)
-                continue
+            if min_vram_gb is not None:
+                try:
+                    vram = float(gpu.get("vram_gb", 0) or 0)
+                    min_v = float(min_vram_gb)
+                except (TypeError, ValueError):
+                    vram = 0.0
+                    min_v = 0.0
+                if vram < min_v:
+                    TASK_QUEUE.append(job_id)
+                    continue
 
         # This agent is allowed to take the job → lease it
         job["status"] = "leased"
@@ -981,310 +886,176 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
         job["leased_ts"] = now
         LEASED_TOTAL += 1
 
-        return {
-            "id": job_id,
-            "op": job["op"],
-            "payload": job["payload"],
-        }
+        return {"job_id": job_id, "op": job["op"], "payload": job["payload"]}
 
-    # Nothing suitable for this agent right now
     return None
 
 
 # -----------------------------------------------------------------------------
-# Results: idempotent completion + health metrics
+# Results
 # -----------------------------------------------------------------------------
 
 @app.post("/result")
 @app.post("/api/result")
 async def post_result(request: Request) -> Dict[str, Any]:
     """
-    Agent posts result:
-
-    {
-      "id": "<job_id>",
-      "agent": "agent-1",
-      "ok": true/false,
-      "result": {...} | null,
-      "error": "..." | null,
-      "op": "map_tokenize",
-      "duration_ms": float | null
-    }
-
-    Idempotent behavior:
-      - First completion for a job sets status & counters.
-      - Subsequent completions for the same job_id are ignored
-        and do not change status or metrics.
-
-    Also updates controller-observed per-agent metrics:
-      - ctrl_tasks_completed / ctrl_tasks_failed
-      - ctrl_error_rate
-      - ctrl_avg_latency_ms
-      - ctrl_latency_samples
+    Agent posts result for a job:
+      {"job_id": "...", "result": {...}} or {"job_id": "...", "error": "..."}
     """
     global COMPLETED_TOTAL, FAILED_TOTAL
 
     payload = await request.json()
-    job_id = payload.get("id")
+    job_id = payload.get("job_id")
     if not job_id:
-        raise HTTPException(status_code=400, detail="Missing 'id'")
+        raise HTTPException(status_code=400, detail="Missing job_id")
 
-    agent_name = payload.get("agent")
     now = _now()
 
     with STATE_LOCK:
         job = JOBS.get(job_id)
         if not job:
-            # Old agents might retry; better to 200/ignore than 404-loop them.
-            return {"status": "ignored", "id": job_id, "reason": "unknown_job_id"}
+            raise HTTPException(status_code=404, detail="Unknown job_id")
 
-        prev_status = job.get("status")
+        # Already completed/failed?
+        if job.get("status") in ("completed", "failed"):
+            return {"status": "ok", "job_id": job_id, "already_done": True}
 
-        # If we've already marked this job completed/failed, ignore duplicates.
-        if prev_status in ("completed", "failed"):
-            return {"status": "ignored", "id": job_id, "reason": "duplicate_result"}
+        err = payload.get("error")
+        result = payload.get("result")
 
-        ok = bool(payload.get("ok", True))
-        job["status"] = "completed" if ok else "failed"
-        job["result"] = payload.get("result")
-        job["error"] = payload.get("error")
         job["completed_ts"] = now
-
         duration_ms = payload.get("duration_ms")
         if duration_ms is None and job.get("leased_ts") is not None:
             duration_ms = (now - job["leased_ts"]) * 1000.0
         job["duration_ms"] = duration_ms
 
-        if ok:
-            COMPLETED_TOTAL += 1
-        else:
-            FAILED_TOTAL += 1
-
-        COMPLETION_TIMES.append(now)
-
-        op = job.get("op") or payload.get("op") or "unknown"
-        OP_COUNTS[op] += 1
+        op = job.get("op") or "unknown"
         if duration_ms is not None:
+            OP_COUNTS[op] += 1
             OP_TOTAL_MS[op] += float(duration_ms)
 
-        # --- Update controller-side per-agent metrics -----------------------
+        # Update controller-maintained per-agent metrics
+        agent_name = job.get("leased_by")
         if agent_name and agent_name in AGENTS:
             entry = AGENTS[agent_name]
             metrics = entry.get("metrics") or {}
 
-            ctrl_completed = int(metrics.get("ctrl_tasks_completed", 0) or 0)
-            ctrl_failed = int(metrics.get("ctrl_tasks_failed", 0) or 0)
-            if ok:
-                ctrl_completed += 1
-            else:
-                ctrl_failed += 1
-
-            total = ctrl_completed + ctrl_failed
-            error_rate = float(ctrl_failed) / float(total) if total > 0 else 0.0
-
-            # Moving average latency
-            if duration_ms is not None:
-                prev_avg = float(metrics.get("ctrl_avg_latency_ms", 0.0) or 0.0)
-                prev_n = int(metrics.get("ctrl_latency_samples", 0) or 0)
-                new_n = prev_n + 1
-                new_avg = (prev_avg * prev_n + float(duration_ms)) / max(new_n, 1)
-            else:
-                new_n = int(metrics.get("ctrl_latency_samples", 0) or 0)
-                new_avg = float(metrics.get("ctrl_avg_latency_ms", 0.0) or 0.0)
-
-            metrics.update(
-                {
-                    "ctrl_tasks_completed": ctrl_completed,
-                    "ctrl_tasks_failed": ctrl_failed,
-                    "ctrl_error_rate": error_rate,
-                    "ctrl_avg_latency_ms": new_avg,
-                    "ctrl_latency_samples": new_n,
-                }
-            )
-            if not ok:
+            if err:
+                failed = int(metrics.get("ctrl_tasks_failed", 0) or 0) + 1
+                metrics["ctrl_tasks_failed"] = failed
                 metrics["ctrl_last_failure_ts"] = now
+            else:
+                completed = int(metrics.get("ctrl_tasks_completed", 0) or 0) + 1
+                metrics["ctrl_tasks_completed"] = completed
+
+            # Update controller avg latency (simple EMA-ish)
+            if duration_ms is not None:
+                prev = metrics.get("ctrl_avg_latency_ms")
+                try:
+                    d = float(duration_ms)
+                except (TypeError, ValueError):
+                    d = None
+                if d is not None:
+                    if prev is None:
+                        metrics["ctrl_avg_latency_ms"] = d
+                    else:
+                        try:
+                            p = float(prev)
+                        except (TypeError, ValueError):
+                            p = d
+                        metrics["ctrl_avg_latency_ms"] = (p * 0.9) + (d * 0.1)
 
             entry["metrics"] = metrics
 
-            # Recompute health state with updated metrics (cluster-aware)
+            # Refresh agent health immediately on failure signals
             state, reason = _compute_agent_state(entry, now)
             _set_agent_health(agent_name, entry, state, reason, now)
 
-    return {"status": "ok", "id": job_id}
-
-
-# -----------------------------------------------------------------------------
-# Jobs / results inspection & submission
-# -----------------------------------------------------------------------------
-
-@app.post("/job")
-@app.post("/api/job")
-async def submit_job(request: Request) -> Dict[str, Any]:
-    """
-    Generic job submission endpoint.
-
-    Supports two shapes:
-
-    1) Single job:
-       {
-         "op": "map_tokenize",
-         "payload": { ... }
-       }
-
-    2) Batch/map jobs (e.g. map_summarize):
-       {
-         "op": "map_summarize",
-         "items": [
-           {"id": "doc-001", "text": "..."},
-           {"id": "doc-002", "text": "..."}
-         ],
-         "params": { ... },
-         "shard_size": 1   # optional, default 1 item per job
-       }
-
-    In batch mode, each shard becomes one job with payload:
-       { "items": [...], "params": {...} }
-    """
-    body = await request.json()
-    op = body.get("op")
-    if not op:
-        raise HTTPException(status_code=400, detail="Missing 'op'")
-
-    items = body.get("items")
-    params = body.get("params") or {}
-    shard_size_raw = body.get("shard_size")
-    payload_single = body.get("payload") or {}
-
-    # Optional timeout override: {"op": "map_summarize", "timeout_s": 1800}
-    requested_timeout = body.get("timeout_s")
-
-    job_ids: List[str] = []
-
-    with STATE_LOCK:
-        # Batch/map mode: items present and non-empty
-        if isinstance(items, list) and items:
-            try:
-                shard_size = int(shard_size_raw) if shard_size_raw is not None else 1
-            except (TypeError, ValueError):
-                shard_size = 1
-            if shard_size < 1:
-                shard_size = 1
-
-            for i in range(0, len(items), shard_size):
-                shard_items = items[i: i + shard_size]
-                job_payload = {
-                    "items": shard_items,
-                    "params": params,
-                }
-                job_ids.append(_enqueue_job(op, job_payload, requested_timeout))
+        if err:
+            job["status"] = "failed"
+            job["error"] = err
+            FAILED_TOTAL += 1
         else:
-            # Single job mode
-            job_ids.append(_enqueue_job(op, payload_single, requested_timeout))
+            job["status"] = "completed"
+            job["result"] = result
+            COMPLETED_TOTAL += 1
+            COMPLETION_TIMES.append(now)
 
-    return {
-        "status": "ok",
-        "op": op,
-        "count": len(job_ids),
-        "job_ids": job_ids,
-    }
+    return {"status": "ok", "job_id": job_id}
 
+
+# -----------------------------------------------------------------------------
+# Jobs / reporting
+# -----------------------------------------------------------------------------
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str) -> Dict[str, Any]:
     with STATE_LOCK:
         job = JOBS.get(job_id)
         if not job:
-            raise HTTPException(status_code=404, detail="Unknown job id")
-        return job
+            raise HTTPException(status_code=404, detail="Unknown job")
+        return dict(job)
 
 
 @app.get("/results")
-def list_results(limit: int = 100) -> List[Dict[str, Any]]:
-    """Recent finished jobs."""
+def list_results(limit: int = 50) -> Dict[str, Any]:
     with STATE_LOCK:
-        finished = [
-            j
-            for j in JOBS.values()
-            if j.get("status") in ("completed", "failed")
-        ]
-        finished.sort(key=lambda j: j.get("completed_ts") or 0.0, reverse=True)
-        return finished[:limit]
+        # return most recent completed/failed jobs
+        jobs = list(JOBS.values())
+        jobs.sort(key=lambda j: j.get("created_ts", 0), reverse=True)
+        data = []
+        for j in jobs:
+            if j.get("status") in ("completed", "failed"):
+                data.append(j)
+            if len(data) >= limit:
+                break
+    return {"results": data}
 
 
 @app.get("/timeline")
-def timeline(limit: int = 200) -> List[Dict[str, Any]]:
-    """Timeline of jobs by created_ts."""
+def timeline(limit: int = 200) -> Dict[str, Any]:
     with STATE_LOCK:
         jobs = list(JOBS.values())
-        jobs.sort(key=lambda j: j.get("created_ts") or 0.0)
-        return jobs[-limit:]
-
-
-# -----------------------------------------------------------------------------
-# Stats / metrics for UI
-# -----------------------------------------------------------------------------
-
-def _calc_rate(window_s: float, now: Optional[float] = None) -> float:
-    """Tasks/sec over the last window_s seconds."""
-    if window_s <= 0:
-        return 0.0
-    if now is None:
-        now = _now()
-    cutoff = now - window_s
-    _prune_completion_times(now)
-    count = sum(1 for t in COMPLETION_TIMES if t >= cutoff)
-    return count / window_s if count > 0 else 0.0
+        jobs.sort(key=lambda j: j.get("created_ts", 0))
+        if limit > 0:
+            jobs = jobs[-limit:]
+        return {"jobs": jobs}
 
 
 @app.get("/stats")
 def stats() -> Dict[str, Any]:
-    """
-    Summary stats for the UI.
-
-    Includes:
-      - agent_states: counts by health state
-      - gpu_agents_online: number of agents with gpu_present == True
-      - total_gpu_vram_gb: sum of vram_gb over gpu agents
-    """
     now = _now()
-    with STATE_LOCK:
-        _refresh_agent_states(now)
+    window_s = 60.0
+    window_5m = 300.0
+    window_15m = 900.0
 
+    with STATE_LOCK:
         agents_online = len(AGENTS)
         queue_len = len(TASK_QUEUE)
         leased_total = LEASED_TOTAL
         completed_total = COMPLETED_TOTAL
         failed_total = FAILED_TOTAL
 
-        _prune_completion_times(now)
+        _prune_completion_times(now, window_15m)
+        times = list(COMPLETION_TIMES)
 
-        rate_1s = _calc_rate(1.0, now)
-        rate_60s = _calc_rate(60.0, now)
-        rate_5m = _calc_rate(300.0, now)
-        rate_15m = _calc_rate(900.0, now)
+        # Rates: count completions in windows
+        rate_1s = sum(1 for t in times if now - t <= 1.0)
+        rate_60s = sum(1 for t in times if now - t <= window_s) / window_s if window_s > 0 else 0
+        rate_5m = sum(1 for t in times if now - t <= window_5m) / window_5m if window_5m > 0 else 0
+        rate_15m = sum(1 for t in times if now - t <= window_15m) / window_15m if window_15m > 0 else 0
 
-        op_counts = dict(OP_COUNTS)
-        op_avg_ms = {
-            op: (OP_TOTAL_MS[op] / count) if count > 0 else 0.0
-            for op, count in OP_COUNTS.items()
-        }
-
-        agent_states: Dict[str, int] = defaultdict(int)
+        # Agent state summary
+        agent_states = defaultdict(int)
         gpu_agents_online = 0
         total_gpu_vram_gb = 0.0
 
         for info in AGENTS.values():
-            state = info.get("state") or "unknown"
-            agent_states[state] += 1
-
+            st = info.get("state") or "unknown"
+            agent_states[st] += 1
             wp = info.get("worker_profile") or {}
-            if isinstance(wp, dict):
-                gpu = wp.get("gpu") or {}
-            else:
-                gpu = {}
-
-            gpu_present = bool(gpu.get("gpu_present"))
-            if gpu_present:
+            gpu = wp.get("gpu") or {}
+            if bool(gpu.get("gpu_present", False)):
                 gpu_agents_online += 1
                 try:
                     vram = float(gpu.get("vram_gb", 0) or 0)
@@ -1303,8 +1074,11 @@ def stats() -> Dict[str, Any]:
         "rate_60s": rate_60s,
         "rate_5m": rate_5m,
         "rate_15m": rate_15m,
-        "op_counts": op_counts,
-        "op_avg_ms": op_avg_ms,
+        "op_counts": dict(OP_COUNTS),
+        "op_avg_ms": {
+            op: (OP_TOTAL_MS[op] / count) if count > 0 else 0.0
+            for op, count in OP_COUNTS.items()
+        },
         "agent_states": dict(agent_states),
         "gpu_agents_online": gpu_agents_online,
         "total_gpu_vram_gb": total_gpu_vram_gb,
@@ -1362,6 +1136,114 @@ def stats_ops() -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
+# Intake / pipelines (digestion slice v1)
+# -----------------------------------------------------------------------------
+
+async def _run_pipeline_run(run_id: str, req: IntakeRequest) -> None:
+    """Background pipeline runner. Uses existing JOBS/TASK_QUEUE machinery."""
+    now = _now()
+    with STATE_LOCK:
+        pr = PIPELINES.get(run_id)
+        if not pr:
+            return
+        pr["status"] = "running"
+        pr["updated_ts"] = now
+        pr["detail"] = "running"
+
+    def enqueue(op: str, payload: Dict[str, Any]) -> str:
+        with STATE_LOCK:
+            return _enqueue_job(op, payload)
+
+    def get_job(job_id: str) -> Optional[Dict[str, Any]]:
+        with STATE_LOCK:
+            return JOBS.get(job_id)
+
+    try:
+        final = await asyncio.to_thread(
+            run_text_pipeline,
+            text=req.text,
+            chunk_chars=req.chunk_chars,
+            overlap_chars=req.overlap_chars,
+            do_summarize=req.do_summarize,
+            do_classify=req.do_classify,
+            labels=req.labels,
+            enqueue_job_fn=enqueue,
+            get_job_fn=get_job,
+            timeout_s=900.0,
+        )
+        with STATE_LOCK:
+            pr = PIPELINES.get(run_id)
+            if pr:
+                pr["status"] = "completed"
+                pr["updated_ts"] = _now()
+                pr["detail"] = "completed"
+                pr["final_result"] = final
+    except Exception as e:
+        with STATE_LOCK:
+            pr = PIPELINES.get(run_id)
+            if pr:
+                pr["status"] = "failed"
+                pr["updated_ts"] = _now()
+                pr["detail"] = f"failed: {type(e).__name__}: {e}"
+
+
+@app.post("/api/intake")
+@app.post("/api/ingest")
+async def intake(request: Request) -> Dict[str, Any]:
+    """
+    Intake endpoint (the 'mouth').
+    Minimal v1: accepts JSON with {text, content_type, chunk_chars, overlap_chars, do_summarize, do_classify, labels}.
+    Returns a run_id that can be polled.
+    """
+    body = await request.json()
+    req = IntakeRequest(
+        content_type=body.get("content_type", "text/plain"),
+        text=body.get("text", "") or "",
+        chunk_chars=int(body.get("chunk_chars", 4000) or 4000),
+        overlap_chars=int(body.get("overlap_chars", 200) or 200),
+        do_summarize=bool(body.get("do_summarize", True)),
+        do_classify=bool(body.get("do_classify", False)),
+        labels=list(body.get("labels") or []),
+    )
+
+    if req.content_type != "text/plain":
+        raise HTTPException(status_code=400, detail="v1 intake supports only content_type=text/plain")
+
+    run_id = str(uuid.uuid4())
+    now = _now()
+    with STATE_LOCK:
+        PIPELINES[run_id] = {
+            "run_id": run_id,
+            "status": "queued",
+            "created_ts": now,
+            "updated_ts": now,
+            "detail": "queued",
+            "request": {
+                "content_type": req.content_type,
+                "chunk_chars": req.chunk_chars,
+                "overlap_chars": req.overlap_chars,
+                "do_summarize": req.do_summarize,
+                "do_classify": req.do_classify,
+                "labels": req.labels,
+            },
+            "final_result": None,
+        }
+
+    asyncio.create_task(_run_pipeline_run(run_id, req))
+    return {"status": "ok", "run_id": run_id}
+
+
+@app.get("/api/pipelines/{run_id}")
+def get_pipeline(run_id: str) -> Dict[str, Any]:
+    """Poll pipeline run status and fetch final_result when ready."""
+    with STATE_LOCK:
+        pr = PIPELINES.get(run_id)
+        if not pr:
+            raise HTTPException(status_code=404, detail="Unknown run_id")
+        return dict(pr)
+
+
+# -----------------------------------------------------------------------------
 # Seeding / purge
 # -----------------------------------------------------------------------------
 
@@ -1370,14 +1252,6 @@ def stats_ops() -> Dict[str, Any]:
 async def seed(request: Request) -> Dict[str, Any]:
     """
     Seed some demo jobs, mostly for smoke tests.
-
-    Body shape (classic mode):
-
-      {
-        "count": 10,
-        "op": "map_tokenize",
-        "payload_template": { "text": "The quick brown fox..." }
-      }
     """
     payload = await request.json()
     count = int(payload.get("count", 10))
