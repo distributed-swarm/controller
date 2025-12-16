@@ -11,6 +11,7 @@ from starlette.responses import Response
 
 from pipelines.engine import run_text_pipeline
 from pipelines.spec import IntakeRequest
+from connectors.ingress_http import parse_intake_body
 
 app = FastAPI(title="Distributed Swarm Controller")
 
@@ -1196,15 +1197,7 @@ async def intake(request: Request) -> Dict[str, Any]:
     Returns a run_id that can be polled.
     """
     body = await request.json()
-    req = IntakeRequest(
-        content_type=body.get("content_type", "text/plain"),
-        text=body.get("text", "") or "",
-        chunk_chars=int(body.get("chunk_chars", 4000) or 4000),
-        overlap_chars=int(body.get("overlap_chars", 200) or 200),
-        do_summarize=bool(body.get("do_summarize", True)),
-        do_classify=bool(body.get("do_classify", False)),
-        labels=list(body.get("labels") or []),
-    )
+    req = parse_intake_body(body)
 
     if req.content_type != "text/plain":
         raise HTTPException(status_code=400, detail="v1 intake supports only content_type=text/plain")
