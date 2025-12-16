@@ -14,12 +14,12 @@ WORKDIR /app
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy controller code
+# Copy controller code (includes app.py, pipelines/, connectors/, etc.)
 COPY . /app
 
-# Healthcheck (same as you had)
+# Healthcheck
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD curl -fsS http://0.0.0.0:8080/healthz || exit 1
 
-# Single-process, async, uvloop, no split-brain
+# Single-process to avoid split-brain (keep workers=1)
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080", "--loop", "uvloop", "--workers", "1"]
