@@ -302,9 +302,8 @@ def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> (
         error_rate = float(tasks_failed) / float(total_tasks)
 
     # Heartbeat-based "suspect": too quiet, but not dead
-    if age > suspect_age and old_state == "healthy":
-        state = "degraded"
-        reason = f"stale_heartbeat_{age:.1f}s"
+    if age > suspect_age:
+    return "stale", f"heartbeat_stale_{age:.1f}s"
 
     # Cluster-aware mode
     mode = _cluster_policy_mode()
