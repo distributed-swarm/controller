@@ -798,7 +798,7 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
     agent_info = AGENTS.get(agent) or {}
     state = agent_info.get("state") or "unknown"
 
-    if state in ("dead", "quarantined", "banned"):
+    if state in ("dead", "quarantined", "banned", "stale"):
         return None
 
     mode = _cluster_policy_mode()
