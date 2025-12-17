@@ -97,7 +97,7 @@ def run_text_pipeline(
         sum_job_ids: List[str] = []
         for idx, chunk in enumerate(chunks):
             payload = {"text": chunk, "chunk_index": idx, "chunks_total": len(chunks)}
-            sum_job_ids.append(enqueue_job_fn("summarize", payload))
+            sum_job_ids.append(enqueue_job_fn("map_summarize", payload))
         chunk_outputs = wait_jobs_complete(sum_job_ids, get_job_fn, timeout_s=timeout_s)
     else:
         chunk_outputs = [{"text": c, "chunk_index": i} for i, c in enumerate(chunks)]
