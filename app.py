@@ -303,7 +303,7 @@ def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> (
 
     # Heartbeat-based "suspect": too quiet, but not dead
     if age > suspect_age:
-    return "stale", f"heartbeat_stale_{age:.1f}s"
+        return "stale", f"heartbeat_stale_{age:.1f}s"
 
     # Cluster-aware mode
     mode = _cluster_policy_mode()
