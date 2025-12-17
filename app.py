@@ -416,7 +416,6 @@ async def _lease_reaper_loop(interval_s: float = 1.0) -> None:
     """
     while True:
         now = _now()
-        reclaimed = 0
 
         with STATE_LOCK:
             for job_id, job in list(JOBS.items()):
@@ -452,7 +451,6 @@ async def _lease_reaper_loop(interval_s: float = 1.0) -> None:
                     job["leased_ts"] = None
                     job["leased_by"] = None
                     TASK_QUEUE.append(job_id)
-                    reclaimed += 1
 
         await asyncio.sleep(interval_s)
 
@@ -491,23 +489,46 @@ def healthz() -> str:
 
 
 # -----------------------------------------------------------------------------
+# Job submission (new)
+# -----------------------------------------------------------------------------
+
+@app.post("/job")
+@app.post("/api/job")
+async def submit_job(request: Request) -> Dict[str, Any]:
+    """
+    Submit one or more jobs.
+
+    Single:
+      {"op": "...", "payload": {...}}
+
+    Batch:
+      [{"op": "...", "payload": {...}}, ...]
+    """
+    body = await request.json()
+
+    def _one(item: Dict[str, Any]) -> str:
+        op = item.get("op")
+        payload = item.get("payload")
+        if not op or payload is None:
+            raise HTTPException(status_code=400, detail="Each job requires {op, payload}")
+        with STATE_LOCK:
+            return _enqueue_job(op, payload)
+
+    if isinstance(body, list):
+        ids = [_one(it) for it in body]
+        return {"status": "ok", "job_ids": ids}
+
+    job_id = _one(body)
+    return {"status": "ok", "job_ids": [job_id]}
+
+
+# -----------------------------------------------------------------------------
 # Agents
 # -----------------------------------------------------------------------------
 
 @app.post("/agents/register")
 @app.post("/api/agents/register")
 async def register_agent(request: Request) -> Dict[str, Any]:
-    """
-    Register an agent.
-
-    Accepts either:
-      {"agent": "name", "labels": {...}, "capabilities": {...}, "worker_profile": {...}}
-    or:
-      {"name": "name", ...}
-
-    Some agents send worker_profile nested under labels["worker_profile"],
-    so we fall back to that if needed.
-    """
     payload = await request.json()
     name = payload.get("agent") or payload.get("name")
     if not name:
@@ -525,7 +546,6 @@ async def register_agent(request: Request) -> Dict[str, Any]:
     now = _now()
 
     # Extract optional metrics from payload.
-    # Accept both top-level fields and nested under "metrics".
     metrics: Dict[str, Any] = {}
     nested_metrics = payload.get("metrics") or {}
     for key in AGENT_METRIC_KEYS:
@@ -551,17 +571,6 @@ async def register_agent(request: Request) -> Dict[str, Any]:
 @app.post("/agents/heartbeat")
 @app.post("/api/agents/heartbeat")
 async def agent_heartbeat(request: Request) -> Dict[str, Any]:
-    """
-    Agent heartbeat. Same shape as register, but forgiving.
-
-    Existing agents that only send {agent/name, labels, capabilities}
-    will continue to work. Newer agents can also send:
-      - metrics: cpu_util, ram_mb, tasks_completed, tasks_failed, avg_task_ms, latency_ms
-      - worker_profile: { cpu: {...}, gpu: {...}, ... }
-
-    Some agents put worker_profile under labels["worker_profile"], so we
-    fall back to that if the top-level field is missing.
-    """
     payload = await request.json()
     name = payload.get("agent") or payload.get("name")
     if not name:
@@ -570,7 +579,6 @@ async def agent_heartbeat(request: Request) -> Dict[str, Any]:
     labels = payload.get("labels") or {}
     capabilities = payload.get("capabilities") or {}
 
-    # Same fallback logic as register_agent
     raw_worker_profile = payload.get("worker_profile")
     if raw_worker_profile is None:
         raw_worker_profile = labels.get("worker_profile")
@@ -578,8 +586,6 @@ async def agent_heartbeat(request: Request) -> Dict[str, Any]:
 
     now = _now()
 
-    # Extract optional metrics from payload.
-    # Accept both top-level fields and nested under "metrics".
     metrics_update: Dict[str, Any] = {}
     nested_metrics = payload.get("metrics") or {}
     for key in AGENT_METRIC_KEYS:
@@ -594,12 +600,10 @@ async def agent_heartbeat(request: Request) -> Dict[str, Any]:
         entry.setdefault("capabilities", {}).update(capabilities)
         entry["last_seen"] = now
 
-        # Merge / update metrics
         existing_metrics = entry.get("metrics") or {}
         existing_metrics.update(metrics_update)
         entry["metrics"] = existing_metrics
 
-        # Store / update worker_profile
         if worker_profile:
             entry["worker_profile"] = worker_profile
         else:
@@ -614,13 +618,6 @@ async def agent_heartbeat(request: Request) -> Dict[str, Any]:
 @app.get("/agents")
 @app.get("/api/agents")
 def list_agents() -> Dict[str, Any]:
-    """
-    Return agents in the shape the UI & scripts expect, plus:
-      - state
-      - health_reason
-      - metrics (if any)
-      - worker_profile (if any)
-    """
     with STATE_LOCK:
         now = _now()
         _refresh_agent_states(now)
@@ -642,9 +639,6 @@ def list_agents() -> Dict[str, Any]:
 @app.post("/agents/{name}/quarantine")
 @app.post("/api/agents/{name}/quarantine")
 async def quarantine_agent(name: str, request: Request) -> Dict[str, Any]:
-    """
-    Manually quarantine an agent: it will receive no new work until restored.
-    """
     reason_default = "manual_quarantine"
 
     try:
@@ -672,9 +666,6 @@ async def quarantine_agent(name: str, request: Request) -> Dict[str, Any]:
 @app.post("/agents/{name}/restore")
 @app.post("/api/agents/{name}/restore")
 async def restore_agent(name: str) -> Dict[str, Any]:
-    """
-    Clear manual quarantine/ban and let health be computed from metrics again.
-    """
     now = _now()
 
     with STATE_LOCK:
@@ -694,9 +685,6 @@ async def restore_agent(name: str) -> Dict[str, Any]:
 @app.post("/agents/{name}/ban")
 @app.post("/api/agents/{name}/ban")
 async def ban_agent(name: str, request: Request) -> Dict[str, Any]:
-    """
-    Permanently ban an agent from receiving work unless manually restored.
-    """
     reason_default = "manual_ban"
 
     try:
@@ -728,25 +716,17 @@ async def ban_agent(name: str, request: Request) -> Dict[str, Any]:
 @app.get("/events")
 @app.get("/api/events")
 def list_events(limit: int = 200) -> Dict[str, Any]:
-    """
-    Return recent health events (state transitions, auto-quarantine, etc.).
-    Most recent last. Limit defaults to 200.
-    """
     with STATE_LOCK:
         if limit <= 0:
             data = []
         else:
             data = HEALTH_EVENTS[-limit:]
-
     return {"events": data}
 
 
 @app.post("/events/clear")
 @app.post("/api/events/clear")
 def clear_events() -> Dict[str, Any]:
-    """
-    Clear the in-memory health event buffer.
-    """
     global HEALTH_EVENTS
     with STATE_LOCK:
         HEALTH_EVENTS = []
@@ -758,10 +738,7 @@ def clear_events() -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 
 @app.get("/task")
-@app.get(
-    "/api/task",
-    summary="Agent polls for next task",
-)
+@app.get("/api/task", summary="Agent polls for next task")
 def get_task(agent: str, wait_ms: int = 0):
     """
     GET /task?agent=agent-1&wait_ms=1000
@@ -772,7 +749,6 @@ def get_task(agent: str, wait_ms: int = 0):
     """
     deadline = _now() + (wait_ms / 1000.0)
 
-    # Simple long-poll loop
     while True:
         with STATE_LOCK:
             task = _lease_next_job(agent)
@@ -787,9 +763,6 @@ def get_task(agent: str, wait_ms: int = 0):
 
 
 def _enqueue_job(op: str, payload: Dict[str, Any]) -> str:
-    """
-    Enqueue a job and return its ID.
-    """
     global JOBS, TASK_QUEUE
 
     job_id = str(uuid.uuid4())
@@ -800,7 +773,6 @@ def _enqueue_job(op: str, payload: Dict[str, Any]) -> str:
         "created_ts": _now(),
         "leased_ts": None,
         "leased_by": None,
-        # Lease timeout in seconds; used by _lease_reaper_loop
         "lease_timeout_s": 300,
         "status": "queued",  # queued | leased | completed | failed
         "result": None,
@@ -817,15 +789,9 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
     """
     Pop the next job from the queue and mark it leased to `agent`.
 
-    Health-aware behavior:
-      - Agents in state dead / quarantined / banned will receive no work.
-      - Degraded agents:
-          • In aggressive mode: only used if there are no healthy workers.
-          • In conservative mode: still used, but health is tracked separately.
-
-    GPU-aware behavior:
-      - If job payload has {"prefer_gpu": true, "min_vram_gb": X}
-        then only agents with gpu_present and vram_gb>=X will receive it.
+    IMPORTANT COMPAT:
+      - Returns BOTH {"id": "..."} and {"job_id": "..."} with same value.
+        Older agents use job_id; newer agents use id.
     """
     global LEASED_TOTAL
 
@@ -833,18 +799,15 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
     agent_info = AGENTS.get(agent) or {}
     state = agent_info.get("state") or "unknown"
 
-    # Hard stops
     if state in ("dead", "quarantined", "banned"):
         return None
 
-    # In aggressive mode, only use degraded agents if there are no healthy workers.
     mode = _cluster_policy_mode()
     if state == "degraded" and mode == "aggressive":
         summary = _cluster_health_summary()
         if summary.get("healthy_workers", 0) > 0:
             return None
 
-    # Pop a job and validate GPU constraints / health constraints
     queue_len = len(TASK_QUEUE)
     for _ in range(queue_len):
         if not TASK_QUEUE:
@@ -881,13 +844,18 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
                     TASK_QUEUE.append(job_id)
                     continue
 
-        # This agent is allowed to take the job → lease it
         job["status"] = "leased"
         job["leased_by"] = agent
         job["leased_ts"] = now
         LEASED_TOTAL += 1
 
-        return {"job_id": job_id, "op": job["op"], "payload": job["payload"]}
+        # Return BOTH keys for compatibility
+        return {
+            "id": job_id,
+            "job_id": job_id,
+            "op": job["op"],
+            "payload": job["payload"],
+        }
 
     return None
 
@@ -900,15 +868,26 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
 @app.post("/api/result")
 async def post_result(request: Request) -> Dict[str, Any]:
     """
-    Agent posts result for a job:
-      {"job_id": "...", "result": {...}} or {"job_id": "...", "error": "..."}
+    Agent posts result (compat mode):
+
+      {
+        "id": "<job_id>" OR "job_id": "<job_id>",
+        "agent": "agent-1",
+        "ok": true/false,
+        "result": {...} | null,
+        "error": "..." | null,
+        "op": "map_tokenize" | null,
+        "duration_ms": float | null
+      }
     """
     global COMPLETED_TOTAL, FAILED_TOTAL
 
     payload = await request.json()
-    job_id = payload.get("job_id")
+
+    # Accept both id and job_id
+    job_id = payload.get("id") or payload.get("job_id")
     if not job_id:
-        raise HTTPException(status_code=400, detail="Missing job_id")
+        raise HTTPException(status_code=400, detail="Missing id/job_id")
 
     now = _now()
 
@@ -917,11 +896,14 @@ async def post_result(request: Request) -> Dict[str, Any]:
         if not job:
             raise HTTPException(status_code=404, detail="Unknown job_id")
 
-        # Already completed/failed?
         if job.get("status") in ("completed", "failed"):
             return {"status": "ok", "job_id": job_id, "already_done": True}
 
         err = payload.get("error")
+        ok_flag = payload.get("ok")
+        if ok_flag is False and not err:
+            err = "ok=false"
+
         result = payload.get("result")
 
         job["completed_ts"] = now
@@ -930,24 +912,22 @@ async def post_result(request: Request) -> Dict[str, Any]:
             duration_ms = (now - job["leased_ts"]) * 1000.0
         job["duration_ms"] = duration_ms
 
-        op = job.get("op") or "unknown"
+        op = job.get("op") or payload.get("op") or "unknown"
         if duration_ms is not None:
             OP_COUNTS[op] += 1
             OP_TOTAL_MS[op] += float(duration_ms)
 
-        # Update controller-maintained per-agent metrics
-        agent_name = job.get("leased_by")
+        # Update controller-maintained per-agent metrics (based on lease owner)
+        agent_name = job.get("leased_by") or payload.get("agent")
         if agent_name and agent_name in AGENTS:
             entry = AGENTS[agent_name]
             metrics = entry.get("metrics") or {}
 
             if err:
-                failed = int(metrics.get("ctrl_tasks_failed", 0) or 0) + 1
-                metrics["ctrl_tasks_failed"] = failed
+                metrics["ctrl_tasks_failed"] = int(metrics.get("ctrl_tasks_failed", 0) or 0) + 1
                 metrics["ctrl_last_failure_ts"] = now
             else:
-                completed = int(metrics.get("ctrl_tasks_completed", 0) or 0) + 1
-                metrics["ctrl_tasks_completed"] = completed
+                metrics["ctrl_tasks_completed"] = int(metrics.get("ctrl_tasks_completed", 0) or 0) + 1
 
             # Update controller avg latency (simple EMA-ish)
             if duration_ms is not None:
@@ -968,7 +948,6 @@ async def post_result(request: Request) -> Dict[str, Any]:
 
             entry["metrics"] = metrics
 
-            # Refresh agent health immediately on failure signals
             state, reason = _compute_agent_state(entry, now)
             _set_agent_health(agent_name, entry, state, reason, now)
 
@@ -1001,7 +980,6 @@ def get_job(job_id: str) -> Dict[str, Any]:
 @app.get("/results")
 def list_results(limit: int = 50) -> Dict[str, Any]:
     with STATE_LOCK:
-        # return most recent completed/failed jobs
         jobs = list(JOBS.values())
         jobs.sort(key=lambda j: j.get("created_ts", 0), reverse=True)
         data = []
@@ -1040,13 +1018,11 @@ def stats() -> Dict[str, Any]:
         _prune_completion_times(now, window_15m)
         times = list(COMPLETION_TIMES)
 
-        # Rates: count completions in windows
         rate_1s = sum(1 for t in times if now - t <= 1.0)
         rate_60s = sum(1 for t in times if now - t <= window_s) / window_s if window_s > 0 else 0
         rate_5m = sum(1 for t in times if now - t <= window_5m) / window_5m if window_5m > 0 else 0
         rate_15m = sum(1 for t in times if now - t <= window_15m) / window_15m if window_15m > 0 else 0
 
-        # Agent state summary
         agent_states = defaultdict(int)
         gpu_agents_online = 0
         total_gpu_vram_gb = 0.0
@@ -1088,9 +1064,6 @@ def stats() -> Dict[str, Any]:
 
 @app.get("/stats/sparkline")
 def stats_sparkline() -> Dict[str, Any]:
-    """
-    Tiny sparkline-friendly throughput series over the last 15 minutes.
-    """
     now = _now()
     window_s = 900.0
     bucket_s = 10.0
@@ -1112,17 +1085,11 @@ def stats_sparkline() -> Dict[str, Any]:
         if 0 <= idx < num_buckets:
             counts[idx] += 1
 
-    return {
-        "buckets": buckets,
-        "values": counts,
-    }
+    return {"buckets": buckets, "values": counts}
 
 
 @app.get("/stats/ops")
 def stats_ops() -> Dict[str, Any]:
-    """
-    Per-op stats for the UI: counts and average ms.
-    """
     with STATE_LOCK:
         op_counts = dict(OP_COUNTS)
         op_avg_ms = {
@@ -1130,10 +1097,7 @@ def stats_ops() -> Dict[str, Any]:
             for op, count in OP_COUNTS.items()
         }
 
-    return {
-        "op_counts": op_counts,
-        "op_avg_ms": op_avg_ms,
-    }
+    return {"op_counts": op_counts, "op_avg_ms": op_avg_ms}
 
 
 # -----------------------------------------------------------------------------
@@ -1141,7 +1105,6 @@ def stats_ops() -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 
 async def _run_pipeline_run(run_id: str, req: IntakeRequest) -> None:
-    """Background pipeline runner. Uses existing JOBS/TASK_QUEUE machinery."""
     now = _now()
     with STATE_LOCK:
         pr = PIPELINES.get(run_id)
@@ -1155,7 +1118,7 @@ async def _run_pipeline_run(run_id: str, req: IntakeRequest) -> None:
         with STATE_LOCK:
             return _enqueue_job(op, payload)
 
-    def get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    def get_job_fn(job_id: str) -> Optional[Dict[str, Any]]:
         with STATE_LOCK:
             return JOBS.get(job_id)
 
@@ -1169,7 +1132,7 @@ async def _run_pipeline_run(run_id: str, req: IntakeRequest) -> None:
             do_classify=req.do_classify,
             labels=req.labels,
             enqueue_job_fn=enqueue,
-            get_job_fn=get_job,
+            get_job_fn=get_job_fn,
             timeout_s=900.0,
         )
         with STATE_LOCK:
@@ -1191,11 +1154,6 @@ async def _run_pipeline_run(run_id: str, req: IntakeRequest) -> None:
 @app.post("/api/intake")
 @app.post("/api/ingest")
 async def intake(request: Request) -> Dict[str, Any]:
-    """
-    Intake endpoint (the 'mouth').
-    Minimal v1: accepts JSON with {text, content_type, chunk_chars, overlap_chars, do_summarize, do_classify, labels}.
-    Returns a run_id that can be polled.
-    """
     body = await request.json()
     req = parse_intake_body(body)
 
@@ -1228,7 +1186,6 @@ async def intake(request: Request) -> Dict[str, Any]:
 
 @app.get("/api/pipelines/{run_id}")
 def get_pipeline(run_id: str) -> Dict[str, Any]:
-    """Poll pipeline run status and fetch final_result when ready."""
     with STATE_LOCK:
         pr = PIPELINES.get(run_id)
         if not pr:
@@ -1243,9 +1200,6 @@ def get_pipeline(run_id: str) -> Dict[str, Any]:
 @app.post("/seed")
 @app.post("/api/seed")
 async def seed(request: Request) -> Dict[str, Any]:
-    """
-    Seed some demo jobs, mostly for smoke tests.
-    """
     payload = await request.json()
     count = int(payload.get("count", 10))
     op = payload.get("op", "map_tokenize")
@@ -1265,9 +1219,6 @@ async def seed(request: Request) -> Dict[str, Any]:
 
 @app.post("/purge")
 def purge() -> Dict[str, Any]:
-    """
-    Blow away all jobs and reset counters. Useful when you want a clean run.
-    """
     global JOBS, TASK_QUEUE, LEASED_TOTAL, COMPLETED_TOTAL, FAILED_TOTAL
     global COMPLETION_TIMES, OP_COUNTS, OP_TOTAL_MS
 
