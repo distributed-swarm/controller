@@ -3,7 +3,7 @@ import time
 import uuid
 import threading
 from collections import deque, defaultdict
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
@@ -39,6 +39,23 @@ OP_TOTAL_MS: Dict[str, float] = defaultdict(float)
 # Health events ring buffer (state transitions, auto-quarantine, etc.)
 HEALTH_EVENTS: List[Dict[str, Any]] = []
 HEALTH_EVENTS_MAX = 500
+
+# -----------------------------------------------------------------------------
+# Risk scoring (cumulative exposure) controller-side projection + config
+# -----------------------------------------------------------------------------
+
+# Default config that can be updated at runtime.
+RISK_CONFIG: Dict[str, Any] = {
+    "tau_sec": 3600.0,
+    "weights": {"food": 1.0, "air": 0.3, "contact": 0.6},
+    "thresholds": {"warn": 10.0, "act": 20.0},
+    # Optional controller-side policy knobs
+    "max_entities": 20000,  # cap in-memory growth
+}
+
+# Friendly projected view keyed by entity_id
+# entity_id -> { B, warn, act, updated_ts, source_job_id, source_agent, source_op }
+RISK_STATE: Dict[str, Dict[str, Any]] = {}
 
 # -----------------------------------------------------------------------------
 # Agent health / autonomic thresholds (cluster-aware policy)
@@ -224,7 +241,7 @@ def _cluster_health_summary() -> Dict[str, Any]:
     }
 
 
-def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> (str, str):
+def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> Tuple[str, str]:
     """
     Compute a health state for an agent based on:
       - manual_state overrides (quarantined / banned)
@@ -234,7 +251,7 @@ def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> (
 
     Returns:
       (state, reason)
-      state ∈ {"healthy", "degraded", "quarantined", "banned", "dead", "unknown"}
+      state ∈ {"healthy", "degraded", "quarantined", "banned", "dead", "stale", "unknown"}
     """
     if now is None:
         now = _now()
@@ -485,6 +502,155 @@ def healthz() -> str:
         f"ok queue={queue_len} agents={agents_online} active_agents={active_agents}",
         media_type="text/plain",
     )
+
+
+# -----------------------------------------------------------------------------
+# Risk endpoints
+# -----------------------------------------------------------------------------
+
+@app.get("/risk/config")
+@app.get("/api/risk/config")
+def get_risk_config() -> Dict[str, Any]:
+    with STATE_LOCK:
+        return {"status": "ok", "config": dict(RISK_CONFIG)}
+
+
+@app.post("/risk/config")
+@app.post("/api/risk/config")
+async def set_risk_config(request: Request) -> Dict[str, Any]:
+    """
+    Update risk config at runtime.
+
+    Accepts partial updates, e.g.:
+      {"tau_sec": 1800, "weights": {"air": 0.5}, "thresholds": {"warn": 8, "act": 16}}
+    """
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="config payload must be an object")
+
+    with STATE_LOCK:
+        # Shallow merge with some guardrails
+        if "tau_sec" in body:
+            try:
+                RISK_CONFIG["tau_sec"] = float(body["tau_sec"])
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="tau_sec must be a number")
+
+        if "max_entities" in body:
+            try:
+                RISK_CONFIG["max_entities"] = int(body["max_entities"])
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="max_entities must be an int")
+
+        if "weights" in body:
+            if not isinstance(body["weights"], dict):
+                raise HTTPException(status_code=400, detail="weights must be an object")
+            # Merge
+            w = dict(RISK_CONFIG.get("weights") or {})
+            for k, v in body["weights"].items():
+                try:
+                    w[str(k)] = float(v)
+                except (TypeError, ValueError):
+                    raise HTTPException(status_code=400, detail=f"weight {k!r} must be a number")
+            RISK_CONFIG["weights"] = w
+
+        if "thresholds" in body:
+            if not isinstance(body["thresholds"], dict):
+                raise HTTPException(status_code=400, detail="thresholds must be an object")
+            t = dict(RISK_CONFIG.get("thresholds") or {})
+            for k, v in body["thresholds"].items():
+                try:
+                    t[str(k)] = float(v)
+                except (TypeError, ValueError):
+                    raise HTTPException(status_code=400, detail=f"threshold {k!r} must be a number")
+            RISK_CONFIG["thresholds"] = t
+
+        # Optional: prune if max_entities decreased
+        max_entities = int(RISK_CONFIG.get("max_entities", 20000) or 20000)
+        if len(RISK_STATE) > max_entities:
+            # Drop oldest by updated_ts
+            items = list(RISK_STATE.items())
+            items.sort(key=lambda kv: float((kv[1] or {}).get("updated_ts", 0) or 0))
+            overflow = len(items) - max_entities
+            for i in range(max(0, overflow)):
+                RISK_STATE.pop(items[i][0], None)
+
+        return {"status": "ok", "config": dict(RISK_CONFIG)}
+
+
+@app.get("/risk/state")
+@app.get("/api/risk/state")
+def get_risk_state(limit: int = 500) -> Dict[str, Any]:
+    """
+    Friendly projected view of risk state for humans/UI.
+
+    Returns the most recently updated entities first.
+    """
+    with STATE_LOCK:
+        items = list(RISK_STATE.items())
+        items.sort(key=lambda kv: float((kv[1] or {}).get("updated_ts", 0) or 0), reverse=True)
+
+        if limit is not None and limit > 0:
+            items = items[: int(limit)]
+
+        data = [{**v, "entity_id": k} for k, v in items]
+        return {"status": "ok", "count": len(data), "entities": data}
+
+
+def _ingest_risk_accumulate_result(
+    result: Any,
+    job_id: str,
+    agent: Optional[str],
+    op: str,
+    now: float,
+) -> None:
+    """
+    Accepts the agent op output from risk_accumulate and updates RISK_STATE.
+
+    Expected typical shape:
+      {"ok": true, "results": [{"entity_id":"u1","B":12.3,"warn":true,"act":false,"now_ts":...,"dt":...}, ...]}
+    """
+    if not isinstance(result, dict):
+        return
+    rows = result.get("results")
+    if not isinstance(rows, list):
+        return
+
+    max_entities = int(RISK_CONFIG.get("max_entities", 20000) or 20000)
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        ent = row.get("entity_id")
+        if not ent:
+            continue
+        ent_id = str(ent)
+
+        try:
+            B = float(row.get("B", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            B = 0.0
+
+        warn = bool(row.get("warn", False))
+        act = bool(row.get("act", False))
+
+        RISK_STATE[ent_id] = {
+            "B": B,
+            "warn": warn,
+            "act": act,
+            "updated_ts": now,
+            "source_job_id": job_id,
+            "source_agent": agent,
+            "source_op": op,
+        }
+
+    # Enforce max size cap
+    if len(RISK_STATE) > max_entities:
+        items = list(RISK_STATE.items())
+        items.sort(key=lambda kv: float((kv[1] or {}).get("updated_ts", 0) or 0))
+        overflow = len(items) - max_entities
+        for i in range(max(0, overflow)):
+            RISK_STATE.pop(items[i][0], None)
 
 
 # -----------------------------------------------------------------------------
@@ -875,7 +1041,7 @@ async def post_result(request: Request) -> Dict[str, Any]:
         "ok": true/false,
         "result": {...} | null,
         "error": "..." | null,
-        "op": "map_tokenize" | null,
+        "op": "map_tokenize" | null
         "duration_ms": float | null
       }
     """
@@ -949,6 +1115,16 @@ async def post_result(request: Request) -> Dict[str, Any]:
 
             state, reason = _compute_agent_state(entry, now)
             _set_agent_health(agent_name, entry, state, reason, now)
+
+        # Ingest risk_accumulate projected state on success
+        if not err and op == "risk_accumulate":
+            _ingest_risk_accumulate_result(
+                result=result,
+                job_id=job_id,
+                agent=agent_name,
+                op=op,
+                now=now,
+            )
 
         if err:
             job["status"] = "failed"
@@ -1039,6 +1215,11 @@ def stats() -> Dict[str, Any]:
                     vram = 0.0
                 total_gpu_vram_gb += vram
 
+        # Risk summary
+        risk_total = len(RISK_STATE)
+        risk_warn = sum(1 for v in RISK_STATE.values() if bool((v or {}).get("warn", False)))
+        risk_act = sum(1 for v in RISK_STATE.values() if bool((v or {}).get("act", False)))
+
     return {
         "time": now,
         "agents_online": agents_online,
@@ -1058,6 +1239,11 @@ def stats() -> Dict[str, Any]:
         "agent_states": dict(agent_states),
         "gpu_agents_online": gpu_agents_online,
         "total_gpu_vram_gb": total_gpu_vram_gb,
+        "risk": {
+            "entities": risk_total,
+            "warn": risk_warn,
+            "act": risk_act,
+        },
     }
 
 
@@ -1220,6 +1406,7 @@ async def seed(request: Request) -> Dict[str, Any]:
 def purge() -> Dict[str, Any]:
     global JOBS, TASK_QUEUE, LEASED_TOTAL, COMPLETED_TOTAL, FAILED_TOTAL
     global COMPLETION_TIMES, OP_COUNTS, OP_TOTAL_MS
+    global RISK_STATE
 
     with STATE_LOCK:
         JOBS = {}
@@ -1230,5 +1417,6 @@ def purge() -> Dict[str, Any]:
         COMPLETION_TIMES = []
         OP_COUNTS = defaultdict(int)
         OP_TOTAL_MS = defaultdict(float)
+        RISK_STATE = {}
 
     return {"status": "ok", "message": "purged"}
