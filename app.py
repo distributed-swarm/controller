@@ -73,6 +73,16 @@ HEALTH_POLICY: Dict[str, Any] = {
         "suspect_age_sec": 40.0,
         "dead_age_sec": 120.0,
     },
+
+    # NEW: sustained-failure quarantine policy (rolling window)
+    # Quarantine is triggered ONLY by sustained recent failures, not lifetime totals.
+    "window": {
+        "size": 50,                 # how many recent outcomes to keep per agent
+        "min_samples": 20,          # don't degrade/quarantine until we have at least this many recent samples
+        "degraded_fail_rate": 0.25, # recent fail rate to mark degraded
+        "quarantine_fail_rate": 0.50,  # recent fail rate to quarantine
+    },
+
     "modes": {
         "aggressive": {
             "error_rate_suspect": 0.05,
@@ -108,6 +118,12 @@ AGENT_METRIC_KEYS = [
     "avg_task_ms",
     "latency_ms",
 ]
+
+# In-memory per-agent rolling window of outcomes:
+#   0 = success
+#   1 = failure (including lease-timeout)
+# Stored on AGENTS[name]["health_window"] as a deque[int].
+HEALTH_WINDOW_KEY = "health_window"
 
 
 def _now() -> float:
@@ -228,6 +244,42 @@ def _in_warmup(info: Dict[str, Any], now: float) -> bool:
         return False
 
 
+def _get_health_window(entry: Dict[str, Any]) -> Deque[int]:
+    w = entry.get(HEALTH_WINDOW_KEY)
+    if isinstance(w, deque):
+        return w
+    # initialize
+    try:
+        size = int((HEALTH_POLICY.get("window") or {}).get("size", 50) or 50)
+    except (TypeError, ValueError):
+        size = 50
+    w = deque(maxlen=max(1, size))
+    entry[HEALTH_WINDOW_KEY] = w
+    return w
+
+
+def _record_outcome(entry: Dict[str, Any], failed: bool) -> None:
+    """
+    Record a recent outcome for sustained-failure policy.
+    failed=True covers task failure AND lease-timeout.
+    """
+    w = _get_health_window(entry)
+    w.append(1 if failed else 0)
+    entry[HEALTH_WINDOW_KEY] = w
+
+
+def _recent_fail_rate(entry: Dict[str, Any]) -> Tuple[int, float]:
+    """
+    Returns (n_samples, fail_rate) for the rolling window.
+    """
+    w = entry.get(HEALTH_WINDOW_KEY)
+    if not isinstance(w, deque) or len(w) == 0:
+        return 0, 0.0
+    n = len(w)
+    fails = sum(1 for x in w if x == 1)
+    return n, (fails / float(n)) if n > 0 else 0.0
+
+
 def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> Tuple[str, str]:
     if now is None:
         now = _now()
@@ -297,11 +349,27 @@ def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> T
     if age > suspect_age:
         return "stale", f"heartbeat_stale_{age:.1f}s"
 
-    mode = _cluster_policy_mode()
-    mode_cfg = policy["modes"][mode]
-    min_tasks = int(policy["min_tasks_for_rate"])
+    # -------------------------------------------------------------------------
+    # NEW: sustained-failure policy (rolling window drives degraded/quarantine)
+    # -------------------------------------------------------------------------
+    win_cfg = policy.get("window") or {}
+    try:
+        win_min = int(win_cfg.get("min_samples", 20) or 20)
+    except (TypeError, ValueError):
+        win_min = 20
+    try:
+        win_degraded = float(win_cfg.get("degraded_fail_rate", 0.25) or 0.25)
+    except (TypeError, ValueError):
+        win_degraded = 0.25
+    try:
+        win_quarantine = float(win_cfg.get("quarantine_fail_rate", 0.50) or 0.50)
+    except (TypeError, ValueError):
+        win_quarantine = 0.50
 
-    # Auto-ban
+    recent_n, recent_fail_rate = _recent_fail_rate(info)
+
+    # Auto-ban still uses lifetime thresholds (big-hammer safety)
+    min_tasks = int(policy["min_tasks_for_rate"])
     if total_tasks >= min_tasks:
         ban_cfg = policy["ban"]
         ban_min_tasks = int(ban_cfg["min_tasks"])
@@ -314,20 +382,16 @@ def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> T
         if ctrl_timeouts >= ban_max_timeouts:
             return "banned", f"auto_ban_timeouts_{ctrl_timeouts}"
 
-    # Quarantine / degraded
-    if total_tasks >= min_tasks:
-        err_quar = float(mode_cfg["error_rate_quarantine"])
-        err_sus = float(mode_cfg["error_rate_suspect"])
-        max_timeouts_quar = int(mode_cfg["max_timeouts_quarantine"])
-
-        if error_rate >= err_quar or ctrl_timeouts >= max_timeouts_quar:
+    # Sustained failure decides degraded/quarantine
+    if recent_n >= win_min:
+        if recent_fail_rate >= win_quarantine:
             state = "quarantined"
-            reason = f"auto_quarantine_err={error_rate:.2f}_timeouts={ctrl_timeouts}"
-        elif error_rate >= err_sus:
+            reason = f"sustained_fail_rate_{recent_fail_rate:.2f}_n={recent_n}"
+        elif recent_fail_rate >= win_degraded:
             state = "degraded"
-            reason = f"elevated_error_rate_{error_rate:.2f}"
+            reason = f"sustained_fail_rate_{recent_fail_rate:.2f}_n={recent_n}"
 
-    # Latency degraded
+    # Latency degraded (can stack)
     degraded_latency = float(policy["latency_ms"]["degraded"])
     if latency_ms is not None and float(latency_ms) >= degraded_latency:
         if state == "healthy":
@@ -336,7 +400,7 @@ def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> T
         else:
             reason = f"{reason}_high_latency_{float(latency_ms):.1f}ms"
 
-    # Auto-recovery
+    # Auto-recovery (prefer rolling window: if recent fail rate is low and no recent failures)
     rec_cfg = policy["recovery"]
     rec_cooldown = float(rec_cfg["cooldown_sec"])
     rec_max_err = float(rec_cfg["max_error_rate"])
@@ -350,7 +414,13 @@ def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> T
             last_fail_age = None
 
     if old_state in ("degraded", "quarantined"):
-        if error_rate <= rec_max_err and (last_fail_age is None or last_fail_age >= rec_cooldown):
+        # Use rolling window if we have it; fallback to lifetime error_rate otherwise
+        if recent_n >= win_min:
+            ok_now = recent_fail_rate <= rec_max_err
+        else:
+            ok_now = error_rate <= rec_max_err
+
+        if ok_now and (last_fail_age is None or last_fail_age >= rec_cooldown):
             state = "healthy"
             reason = "recovered"
 
@@ -411,7 +481,11 @@ async def _lease_reaper_loop(interval_s: float = 1.0) -> None:
                         if not _in_warmup(entry, now):
                             timeouts = int(metrics.get("ctrl_lease_timeouts", 0) or 0)
                             metrics["ctrl_lease_timeouts"] = timeouts + 1
+                            metrics["ctrl_last_failure_ts"] = now
                             entry["metrics"] = metrics
+
+                            # NEW: treat lease timeout as a failure in the rolling window
+                            _record_outcome(entry, failed=True)
 
                             state, reason = _compute_agent_state(entry, now)
                             _set_agent_health(agent_name, entry, state, reason, now)
@@ -702,6 +776,9 @@ async def register_agent(request: Request) -> Dict[str, Any]:
             "metrics": metrics,
             "warmup_until_ts": now + warmup_sec,
         }
+        # init rolling window
+        _get_health_window(info)
+
         state, reason = _compute_agent_state(info, now)
         _set_agent_health(name, info, state, reason, now)
 
@@ -751,6 +828,9 @@ async def agent_heartbeat(request: Request) -> Dict[str, Any]:
         else:
             entry.setdefault("worker_profile", {})
 
+        # ensure rolling window exists
+        _get_health_window(entry)
+
         # If the agent disappeared long enough, treat as restart and re-warm
         try:
             restart_gap = float(WARMUP_POLICY.get("restart_gap_sec", 45.0) or 45.0)
@@ -784,8 +864,11 @@ def list_agents() -> Dict[str, Any]:
         now = _now()
         _refresh_agent_states(now)
 
-        return {
-            name: {
+        out = {}
+        for name, info in AGENTS.items():
+            # expose rolling window summary (not the whole buffer)
+            n, fr = _recent_fail_rate(info)
+            out[name] = {
                 "labels": dict(info.get("labels") or {}),
                 "capabilities": dict(info.get("capabilities") or {}),
                 "last_seen": info.get("last_seen"),
@@ -794,9 +877,9 @@ def list_agents() -> Dict[str, Any]:
                 "metrics": dict(info.get("metrics") or {}),
                 "worker_profile": dict(info.get("worker_profile") or {}),
                 "warmup_until_ts": info.get("warmup_until_ts"),
+                "recent": {"n": n, "fail_rate": fr},
             }
-            for name, info in AGENTS.items()
-        }
+        return out
 
 
 @app.post("/agents/{name}/quarantine")
@@ -899,7 +982,7 @@ def clear_events() -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# Task leasing (FIXED: pinned agent honored)
+# Task leasing (FIXED: pinned agent honored + LEASE FIX)
 # -----------------------------------------------------------------------------
 
 @app.get("/task")
@@ -952,7 +1035,8 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
             if not job:
                 continue
 
-            if job.get("status") not in ("queued", "leased"):
+            # LEASE FIX: only lease queued jobs (never re-lease leased/completed/failed)
+            if job.get("status") != "queued":
                 continue
 
             pinned = job.get("pinned_agent")
@@ -1059,17 +1143,23 @@ async def post_result(request: Request) -> Dict[str, Any]:
             entry = AGENTS[agent_name]
             metrics = entry.get("metrics") or {}
 
+            # Ensure window exists
+            _get_health_window(entry)
+
             # During warmup, do NOT count failures against agent health
             if not _in_warmup(entry, now):
                 if err:
                     metrics["ctrl_tasks_failed"] = int(metrics.get("ctrl_tasks_failed", 0) or 0) + 1
                     metrics["ctrl_last_failure_ts"] = now
+                    _record_outcome(entry, failed=True)
                 else:
                     metrics["ctrl_tasks_completed"] = int(metrics.get("ctrl_tasks_completed", 0) or 0) + 1
+                    _record_outcome(entry, failed=False)
             else:
-                # Still count successes if you want (optional). Keeping it neutral.
+                # Keep warmup neutral, but still record successes (helps window fill without punishing)
                 if not err:
                     metrics["ctrl_tasks_completed"] = int(metrics.get("ctrl_tasks_completed", 0) or 0) + 1
+                    _record_outcome(entry, failed=False)
 
             if duration_ms is not None:
                 prev = metrics.get("ctrl_avg_latency_ms")
