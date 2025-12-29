@@ -940,6 +940,7 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
     #   Pass 1: jobs pinned to this agent
     #   Pass 2: unpinned jobs
     def _try_pass(require_pinned_match: bool) -> Optional[Dict[str, Any]]:
+        global LEASED_TOTAL
         nonlocal now
         queue_len = len(TASK_QUEUE)
         for _ in range(queue_len):
