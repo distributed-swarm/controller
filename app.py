@@ -32,6 +32,8 @@ JOBS: Dict[str, Dict[str, Any]] = {}
 TASK_QUEUES: Dict[int, Deque[str]] = {0: deque(), 1: deque(), 2: deque(), 3: deque()}
 
 # ALIAS: Back-compat for legacy code (defaults to Excitatory Level 1)
+# NOTE: This alias points to the specific deque object at TASK_QUEUES[1].
+# Do not reassign TASK_QUEUES entirely, or this alias will point to a dead object.
 TASK_QUEUE: Deque[str] = TASK_QUEUES[1]
 
 # Pipeline runs (digestion layer) tracked in-memory for now
@@ -521,7 +523,7 @@ async def controller_startup() -> None:
 # -----------------------------------------------------------------------------
 
 @app.get("/healthz", response_class=PlainTextResponse)
-def healthz() -> str:
+def healthz() -> Response:
     with STATE_LOCK:
         now = _now()
         _refresh_agent_states(now)
@@ -1505,12 +1507,20 @@ async def seed(request: Request) -> Dict[str, Any]:
 def purge() -> Dict[str, Any]:
     global JOBS, TASK_QUEUES, LEASED_TOTAL, COMPLETED_TOTAL, FAILED_TOTAL
     global COMPLETION_TIMES, OP_COUNTS, OP_TOTAL_MS
-    global RISK_STATE
+    global RISK_STATE, PIPELINES, HEALTH_EVENTS  # NEW: Added PIPELINES and HEALTH_EVENTS
 
     with STATE_LOCK:
         JOBS = {}
-        # NEW: Reset all 4 queues
-        TASK_QUEUES = {0: deque(), 1: deque(), 2: deque(), 3: deque()}
+        
+        # CORRECTED: Do NOT re-bind TASK_QUEUES. 
+        # Clear the deque objects in-place so TASK_QUEUE alias remains valid.
+        for q in TASK_QUEUES.values():
+            q.clear()
+            
+        # NEW: Clear pipelines and health events for a true purge
+        PIPELINES = {}
+        HEALTH_EVENTS = []
+            
         LEASED_TOTAL = 0
         COMPLETED_TOTAL = 0
         FAILED_TOTAL = 0
