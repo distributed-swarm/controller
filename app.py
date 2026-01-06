@@ -1117,6 +1117,20 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
                         if vram < min_v:
                             q.append(job_id)
                             continue
+# Lateral inhibition (brainstem)
+# Pinned jobs must always win; only gate UNPINNED selection.
+if ENABLE_LATERAL_INHIBITION:
+    op_name = job.get("op") or "unknown"
+    pinned_agent = job.get("pinned_agent")
+
+    if pinned_agent is None:
+        if not BRAIN.allow_lease(
+            requesting_agent=agent,
+            op=str(op_name),
+            now=now,
+        ):
+            q.append(job_id)
+            continue
 
                 job["status"] = "leased"
                 job["leased_by"] = agent
