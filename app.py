@@ -12,8 +12,15 @@ from starlette.responses import Response
 from pipelines.engine import run_text_pipeline
 from pipelines.spec import IntakeRequest
 from connectors.ingress_http import parse_intake_body
+from brainstem import Brainstem
 
 app = FastAPI(title="Distributed Swarm Controller")
+
+# -----------------------------------------------------------------------------
+# Brainstem (stable scheduling policy)
+# -----------------------------------------------------------------------------
+BRAIN = Brainstem()
+ENABLE_LATERAL_INHIBITION = True  # flip False for instant rollback
 
 # -----------------------------------------------------------------------------
 # In-memory state
