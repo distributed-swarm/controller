@@ -1115,9 +1115,14 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
                         q.append(job_id)
                         continue
 
-                payload = job.get("payload") or {}
-                prefer_gpu = bool(payload.get("prefer_gpu", False))
-                min_vram_gb = payload.get("min_vram_gb")
+                payload = job.get("payload")
+
+                # Scheduling hints are only supported when payload is a dict.
+                payload_meta = payload if isinstance(payload, dict) else {}
+
+                prefer_gpu = bool(payload_meta.get("prefer_gpu", False))
+                min_vram_gb = payload_meta.get("min_vram_gb")
+
 
                 if prefer_gpu:
                     wp = agent_info.get("worker_profile") or {}
