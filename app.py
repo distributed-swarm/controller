@@ -9,6 +9,8 @@ from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.responses import PlainTextResponse, JSONResponse
 from starlette.responses import Response
 
+from controller.api.v1.events import publish_event
+
 from pipelines.engine import run_text_pipeline
 from pipelines.spec import IntakeRequest
 from connectors.ingress_http import parse_intake_body
