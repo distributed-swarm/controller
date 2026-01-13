@@ -436,38 +436,24 @@ def _refresh_agent_states(now: Optional[float] = None) -> None:
 
 
 # -----------------------------------------------------------------------------
-# Capability helpers (THIS IS THE BLOCKER FIX)
+# Capability helpers (op gating for leasing)  <-- FIX ADDED
 # -----------------------------------------------------------------------------
 def _agent_ops(agent_info: Dict[str, Any]) -> set:
-    """
-    Normalize agent capabilities.ops into a set[str].
-    Supports:
-      capabilities = {"ops": ["echo", ...]}
-      capabilities = {"ops": {"echo": True, ...}}
-      capabilities = {"ops": "echo"} (edge)
-    """
+    """Normalize agent capabilities.ops into a set[str]."""
     caps = agent_info.get("capabilities") or {}
     ops = caps.get("ops")
-
     if ops is None:
         return set()
-
     if isinstance(ops, list):
         return {str(x) for x in ops if x is not None}
-
     if isinstance(ops, dict):
-        # treat keys with truthy values as enabled; if values are missing, include all keys
         out = set()
         for k, v in ops.items():
-            if v is None:
-                out.add(str(k))
-            elif bool(v):
+            if v is None or bool(v):
                 out.add(str(k))
         return out
-
     if isinstance(ops, str):
         return {ops}
-
     return set()
 
 
@@ -1094,18 +1080,17 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
                         continue
 
                 # -----------------------------------------------------------------
-                # BLOCKER FIX: capability gating (op must be supported by agent)
+                # FIX: do not lease jobs to agents that cannot execute the job op
                 # -----------------------------------------------------------------
                 op_name = str(job.get("op") or "unknown")
                 if not _agent_can_run(agent_info, op_name):
-                    # Put it back, this agent can't run it.
                     q.append(job_id)
                     continue
 
                 payload = job.get("payload")
-                payload_meta = payload if isinstance(payload, dict) else {}
 
-                # Optional scheduling hints
+                # Scheduling hints are only supported when payload is a dict.
+                payload_meta = payload if isinstance(payload, dict) else {}
                 prefer_gpu = bool(payload_meta.get("prefer_gpu", False))
                 min_vram_gb = payload_meta.get("min_vram_gb")
 
@@ -1129,11 +1114,13 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
                             continue
 
                 # Lateral inhibition (brainstem)
-                # Only gate UNPINNED selection; pinned jobs always win.
-                if ENABLE_LATERAL_INHIBITION and job.get("pinned_agent") is None:
-                    if not BRAIN.allow_lease(requesting_agent=agent, op=op_name, now=now):
-                        q.append(job_id)
-                        continue
+                # Pinned jobs must always win; only gate UNPINNED selection.
+                if ENABLE_LATERAL_INHIBITION:
+                    pinned_agent = job.get("pinned_agent")
+                    if pinned_agent is None:
+                        if not BRAIN.allow_lease(requesting_agent=agent, op=op_name, now=now):
+                            q.append(job_id)
+                            continue
 
                 # Lease it
                 job["status"] = "leased"
