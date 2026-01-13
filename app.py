@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.responses import PlainTextResponse, JSONResponse
 from starlette.responses import Response
 
-from controller.api.v1.events import publish_event
+from api.v1.events import publish_event
 
 from pipelines.engine import run_text_pipeline
 from pipelines.spec import IntakeRequest
@@ -18,7 +18,7 @@ from brainstem import Brainstem
 
 app = FastAPI(title="Distributed Swarm Controller")
 
-from controller.api.v1 import router as v1_router
+from api.v1 import router as v1_router
 app.include_router(v1_router, prefix="/v1")
 
 # -----------------------------------------------------------------------------
