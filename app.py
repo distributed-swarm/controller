@@ -1056,7 +1056,7 @@ def get_task(agent: str, wait_ms: int = 0):
 
         if task is not None:
             return JSONResponse(task)
-
+     
         if _now() >= deadline:
             return Response(status_code=204)
 
@@ -1156,7 +1156,21 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
                 job["leased_by"] = agent
                 job["leased_ts"] = now
                 LEASED_TOTAL += 1
-
+                # --- v1 SSE notifications (never break scheduling) ---
+                try:
+                    publish_event("job.updated", {
+                        "job_id": job_id,
+                        "op": job.get("op"),
+                        "state": "leased",
+                        "agent": agent,
+                        "priority": job.get("excitatory_level"),
+                    })
+                    publish_event("queue.updated", {
+                        "queue_depth": sum(len(q) for q in TASK_QUEUES.values()),
+                    })
+                 except Exception:
+                     pass
+                     
                 return {
                     "id": job_id,
                     "job_id": job_id,
