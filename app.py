@@ -1292,6 +1292,18 @@ async def post_result(request: Request) -> Dict[str, Any]:
             job["result"] = result
             COMPLETED_TOTAL += 1
             COMPLETION_TIMES.append(now)
+                # --- v1 SSE notifications (never break scheduling) ---
+        try:
+            v1_state = "succeeded" if job.get("status") == "completed" else job.get("status")
+            publish_event("job.updated", {
+                "job_id": job_id,
+                "op": op,
+                "state": v1_state,
+                "agent": job.get("leased_by"),
+                "duration_ms": job.get("duration_ms"),
+            })
+        except Exception:
+            pass
 
     return {"status": "ok", "job_id": job_id}
 
