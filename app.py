@@ -1168,8 +1168,8 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
                     publish_event("queue.updated", {
                         "queue_depth": sum(len(q) for q in TASK_QUEUES.values()),
                     })
-                 except Exception:
-                     pass
+                except Exception:
+                    pass
                      
                 return {
                     "id": job_id,
