@@ -10,6 +10,7 @@ from fastapi.responses import PlainTextResponse, JSONResponse
 from starlette.responses import Response
 
 from api.v1.events import publish_event
+from api.v1 import router as v1_router
 
 from pipelines.engine import run_text_pipeline
 from pipelines.spec import IntakeRequest
@@ -17,8 +18,6 @@ from connectors.ingress_http import parse_intake_body
 from brainstem import Brainstem
 
 app = FastAPI(title="Distributed Swarm Controller")
-
-from api.v1 import router as v1_router
 app.include_router(v1_router, prefix="/v1")
 
 # -----------------------------------------------------------------------------
@@ -30,25 +29,21 @@ ENABLE_LATERAL_INHIBITION = True  # flip False for instant rollback
 # -----------------------------------------------------------------------------
 # In-memory state
 # -----------------------------------------------------------------------------
-
 STATE_LOCK = threading.Lock()
 
 AGENTS: Dict[str, Dict[str, Any]] = {}
 JOBS: Dict[str, Dict[str, Any]] = {}
 
-# NEW: Multiple priority queues by excitatory level (0..3)
+# Multiple priority queues by excitatory level (0..3)
 # 3 = Reflex (Immediate SAP Trigger)
 # 2 = High Priority (Human Approved)
 # 1 = Standard (Default / OCR)
 # 0 = Background (Cleanup)
 TASK_QUEUES: Dict[int, Deque[str]] = {0: deque(), 1: deque(), 2: deque(), 3: deque()}
 
-# ALIAS: Back-compat for legacy code (defaults to Excitatory Level 1)
-# NOTE: This alias points to the specific deque object at TASK_QUEUES[1].
-# Do not reassign TASK_QUEUES entirely, or this alias will point to a dead object.
+# Back-compat alias (defaults to Excitatory Level 1)
 TASK_QUEUE: Deque[str] = TASK_QUEUES[1]
 
-# Pipeline runs (digestion layer) tracked in-memory for now
 PIPELINES: Dict[str, Dict[str, Any]] = {}
 
 LEASED_TOTAL = 0
@@ -59,53 +54,42 @@ COMPLETION_TIMES: List[float] = []
 OP_COUNTS: Dict[str, int] = defaultdict(int)
 OP_TOTAL_MS: Dict[str, float] = defaultdict(float)
 
-# Health events ring buffer (state transitions, auto-quarantine, etc.)
 HEALTH_EVENTS: List[Dict[str, Any]] = []
 HEALTH_EVENTS_MAX = 500
 
 # -----------------------------------------------------------------------------
-# Warmup / “stretch” (prevents instant auto-quarantine on wake)
+# Warmup / “stretch”
 # -----------------------------------------------------------------------------
-
 WARMUP_POLICY: Dict[str, Any] = {
-    # After register (or after a long heartbeat gap), ignore error-rate/timeouts for this long
     "warmup_sec": 20.0,
-    # If heartbeat gap exceeds this, we treat it like a restart and re-warm
     "restart_gap_sec": 45.0,
 }
 
 # -----------------------------------------------------------------------------
-# Risk scoring (cumulative exposure) controller-side projection + config
+# Risk scoring config/state
 # -----------------------------------------------------------------------------
-
 RISK_CONFIG: Dict[str, Any] = {
     "tau_sec": 3600.0,
     "weights": {"food": 1.0, "air": 0.3, "contact": 0.6},
     "thresholds": {"warn": 10.0, "act": 20.0},
     "max_entities": 20000,
 }
-
 RISK_STATE: Dict[str, Dict[str, Any]] = {}
 
 # -----------------------------------------------------------------------------
-# Agent health / autonomic thresholds (cluster-aware policy)
+# Agent health policy
 # -----------------------------------------------------------------------------
-
 HEALTH_POLICY: Dict[str, Any] = {
     "heartbeat": {
         "suspect_age_sec": 40.0,
         "dead_age_sec": 120.0,
     },
-
-    # NEW: sustained-failure quarantine policy (rolling window)
-    # Quarantine is triggered ONLY by sustained recent failures, not lifetime totals.
     "window": {
-        "size": 50,                 # how many recent outcomes to keep per agent
-        "min_samples": 20,          # don't degrade/quarantine until we have at least this many recent samples
-        "degraded_fail_rate": 0.25, # recent fail rate to mark degraded
-        "quarantine_fail_rate": 0.50,  # recent fail rate to quarantine
+        "size": 50,
+        "min_samples": 20,
+        "degraded_fail_rate": 0.25,
+        "quarantine_fail_rate": 0.50,
     },
-
     "modes": {
         "aggressive": {
             "error_rate_suspect": 0.05,
@@ -142,10 +126,6 @@ AGENT_METRIC_KEYS = [
     "latency_ms",
 ]
 
-# In-memory per-agent rolling window of outcomes:
-#   0 = success
-#   1 = failure (including lease-timeout)
-# Stored on AGENTS[name]["health_window"] as a deque[int].
 HEALTH_WINDOW_KEY = "health_window"
 
 
@@ -271,7 +251,6 @@ def _get_health_window(entry: Dict[str, Any]) -> Deque[int]:
     w = entry.get(HEALTH_WINDOW_KEY)
     if isinstance(w, deque):
         return w
-    # initialize
     try:
         size = int((HEALTH_POLICY.get("window") or {}).get("size", 50) or 50)
     except (TypeError, ValueError):
@@ -282,19 +261,12 @@ def _get_health_window(entry: Dict[str, Any]) -> Deque[int]:
 
 
 def _record_outcome(entry: Dict[str, Any], failed: bool) -> None:
-    """
-    Record a recent outcome for sustained-failure policy.
-    failed=True covers task failure AND lease-timeout.
-    """
     w = _get_health_window(entry)
     w.append(1 if failed else 0)
     entry[HEALTH_WINDOW_KEY] = w
 
 
 def _recent_fail_rate(entry: Dict[str, Any]) -> Tuple[int, float]:
-    """
-    Returns (n_samples, fail_rate) for the rolling window.
-    """
     w = entry.get(HEALTH_WINDOW_KEY)
     if not isinstance(w, deque) or len(w) == 0:
         return 0, 0.0
@@ -333,7 +305,6 @@ def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> T
     if age > dead_age:
         return "dead", "missed_heartbeat"
 
-    # Warmup: only heartbeat rules apply (prevents instant quarantine on wake)
     if _in_warmup(info, now):
         if age > suspect_age:
             return "stale", f"heartbeat_stale_{age:.1f}s"
@@ -361,10 +332,6 @@ def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> T
 
     latency_ms = ctrl_avg_latency_ms if ctrl_avg_latency_ms is not None else agent_latency_ms
 
-    old_state = info.get("state") or "unknown"
-    state = "healthy"
-    reason = "normal"
-
     error_rate = 0.0
     if total_tasks > 0:
         error_rate = float(tasks_failed) / float(total_tasks)
@@ -372,9 +339,6 @@ def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> T
     if age > suspect_age:
         return "stale", f"heartbeat_stale_{age:.1f}s"
 
-    # -------------------------------------------------------------------------
-    # NEW: sustained-failure policy (rolling window drives degraded/quarantine)
-    # -------------------------------------------------------------------------
     win_cfg = policy.get("window") or {}
     try:
         win_min = int(win_cfg.get("min_samples", 20) or 20)
@@ -391,7 +355,6 @@ def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> T
 
     recent_n, recent_fail_rate = _recent_fail_rate(info)
 
-    # Auto-ban still uses lifetime thresholds (big-hammer safety)
     min_tasks = int(policy["min_tasks_for_rate"])
     if total_tasks >= min_tasks:
         ban_cfg = policy["ban"]
@@ -405,7 +368,9 @@ def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> T
         if ctrl_timeouts >= ban_max_timeouts:
             return "banned", f"auto_ban_timeouts_{ctrl_timeouts}"
 
-    # Sustained failure decides degraded/quarantine
+    state = "healthy"
+    reason = "normal"
+
     if recent_n >= win_min:
         if recent_fail_rate >= win_quarantine:
             state = "quarantined"
@@ -414,7 +379,6 @@ def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> T
             state = "degraded"
             reason = f"sustained_fail_rate_{recent_fail_rate:.2f}_n={recent_n}"
 
-    # Latency degraded (can stack)
     degraded_latency = float(policy["latency_ms"]["degraded"])
     if latency_ms is not None and float(latency_ms) >= degraded_latency:
         if state == "healthy":
@@ -423,7 +387,6 @@ def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> T
         else:
             reason = f"{reason}_high_latency_{float(latency_ms):.1f}ms"
 
-    # Auto-recovery (prefer rolling window: if recent fail rate is low and no recent failures)
     rec_cfg = policy["recovery"]
     rec_cooldown = float(rec_cfg["cooldown_sec"])
     rec_max_err = float(rec_cfg["max_error_rate"])
@@ -436,8 +399,8 @@ def _compute_agent_state(info: Dict[str, Any], now: Optional[float] = None) -> T
         except (TypeError, ValueError):
             last_fail_age = None
 
+    old_state = info.get("state") or "unknown"
     if old_state in ("degraded", "quarantined"):
-        # Use rolling window if we have it; fallback to lifetime error_rate otherwise
         if recent_n >= win_min:
             ok_now = recent_fail_rate <= rec_max_err
         else:
@@ -467,15 +430,57 @@ def _set_agent_health(name: str, entry: Dict[str, Any], state: str, reason: str,
 def _refresh_agent_states(now: Optional[float] = None) -> None:
     if now is None:
         now = _now()
-    for name, info in AGENTS.items():
+    for name, info in list(AGENTS.items()):
         state, reason = _compute_agent_state(info, now)
         _set_agent_health(name, info, state, reason, now)
 
 
 # -----------------------------------------------------------------------------
+# Capability helpers (THIS IS THE BLOCKER FIX)
+# -----------------------------------------------------------------------------
+def _agent_ops(agent_info: Dict[str, Any]) -> set:
+    """
+    Normalize agent capabilities.ops into a set[str].
+    Supports:
+      capabilities = {"ops": ["echo", ...]}
+      capabilities = {"ops": {"echo": True, ...}}
+      capabilities = {"ops": "echo"} (edge)
+    """
+    caps = agent_info.get("capabilities") or {}
+    ops = caps.get("ops")
+
+    if ops is None:
+        return set()
+
+    if isinstance(ops, list):
+        return {str(x) for x in ops if x is not None}
+
+    if isinstance(ops, dict):
+        # treat keys with truthy values as enabled; if values are missing, include all keys
+        out = set()
+        for k, v in ops.items():
+            if v is None:
+                out.add(str(k))
+            elif bool(v):
+                out.add(str(k))
+        return out
+
+    if isinstance(ops, str):
+        return {ops}
+
+    return set()
+
+
+def _agent_can_run(agent_info: Dict[str, Any], op: str) -> bool:
+    try:
+        return str(op) in _agent_ops(agent_info)
+    except Exception:
+        return False
+
+
+# -----------------------------------------------------------------------------
 # Lease reaper
 # -----------------------------------------------------------------------------
-
 async def _lease_reaper_loop(interval_s: float = 1.0) -> None:
     while True:
         now = _now()
@@ -500,14 +505,11 @@ async def _lease_reaper_loop(interval_s: float = 1.0) -> None:
                     if agent_name and agent_name in AGENTS:
                         entry = AGENTS[agent_name]
                         metrics = entry.get("metrics") or {}
-                        # During warmup, don’t punish timeouts
                         if not _in_warmup(entry, now):
                             timeouts = int(metrics.get("ctrl_lease_timeouts", 0) or 0)
                             metrics["ctrl_lease_timeouts"] = timeouts + 1
                             metrics["ctrl_last_failure_ts"] = now
                             entry["metrics"] = metrics
-
-                            # NEW: treat lease timeout as a failure in the rolling window
                             _record_outcome(entry, failed=True)
 
                             state, reason = _compute_agent_state(entry, now)
@@ -516,8 +518,7 @@ async def _lease_reaper_loop(interval_s: float = 1.0) -> None:
                     job["status"] = "queued"
                     job["leased_ts"] = None
                     job["leased_by"] = None
-                    
-                    # NEW: RE-QUEUE to correct priority level
+
                     lvl = int(job.get("excitatory_level", 1) or 1)
                     lvl = max(0, min(3, lvl))
                     TASK_QUEUES[lvl].append(job_id)
@@ -533,13 +534,11 @@ async def controller_startup() -> None:
 # -----------------------------------------------------------------------------
 # Health
 # -----------------------------------------------------------------------------
-
 @app.get("/healthz", response_class=PlainTextResponse)
 def healthz() -> Response:
     with STATE_LOCK:
         now = _now()
         _refresh_agent_states(now)
-        # NEW: Sum all queues
         queue_len = sum(len(q) for q in TASK_QUEUES.values())
         agents_online = len(AGENTS)
         active_agents = sum(1 for info in AGENTS.values() if info.get("state") != "dead")
@@ -553,7 +552,6 @@ def healthz() -> Response:
 # -----------------------------------------------------------------------------
 # Risk endpoints
 # -----------------------------------------------------------------------------
-
 @app.get("/risk/config")
 @app.get("/api/risk/config")
 def get_risk_config() -> Dict[str, Any]:
@@ -628,13 +626,7 @@ def get_risk_state(limit: int = 500) -> Dict[str, Any]:
         return {"status": "ok", "count": len(data), "entities": data}
 
 
-def _ingest_risk_accumulate_result(
-    result: Any,
-    job_id: str,
-    agent: Optional[str],
-    op: str,
-    now: float,
-) -> None:
+def _ingest_risk_accumulate_result(result: Any, job_id: str, agent: Optional[str], op: str, now: float) -> None:
     if not isinstance(result, dict):
         return
     rows = result.get("results")
@@ -678,19 +670,17 @@ def _ingest_risk_accumulate_result(
 
 
 # -----------------------------------------------------------------------------
-# Job submission (FIXED: supports job_id + pinned agent + EXCITATORY LEVELS)
+# Job submission
 # -----------------------------------------------------------------------------
-
 def _is_agent_available_for_pin(name: str) -> bool:
     info = AGENTS.get(name)
     if not info:
         return False
     st = info.get("state") or "unknown"
-    # treat degraded as “available” unless you want pins to require healthy only
     return st in ("healthy", "degraded")
 
+
 def _lease_timeout_for_level(level: int) -> int:
-    """Higher excitatory_level = shorter lease (fail fast)."""
     if level >= 3:
         return 15
     if level == 2:
@@ -699,15 +689,19 @@ def _lease_timeout_for_level(level: int) -> int:
         return 300
     return 300
 
-def _enqueue_job(op: str, payload: Dict[str, Any], job_id: Optional[str] = None, pinned_agent: Optional[str] = None, excitatory_level: int = 1) -> str:
-    global JOBS, TASK_QUEUES
 
+def _enqueue_job(
+    op: str,
+    payload: Any,
+    job_id: Optional[str] = None,
+    pinned_agent: Optional[str] = None,
+    excitatory_level: int = 1,
+) -> str:
     if job_id is None:
         job_id = str(uuid.uuid4())
 
-    # Ensure level is valid
     lvl = max(0, min(3, int(excitatory_level)))
-    
+
     job = {
         "id": job_id,
         "op": op,
@@ -716,32 +710,24 @@ def _enqueue_job(op: str, payload: Dict[str, Any], job_id: Optional[str] = None,
         "leased_ts": None,
         "leased_by": None,
         "lease_timeout_s": _lease_timeout_for_level(lvl),
-        "status": "queued",  # queued | leased | completed | failed
+        "status": "queued",
         "result": None,
         "error": None,
         "completed_ts": None,
         "duration_ms": None,
         "pinned_agent": pinned_agent,
-        # NEW: Store the level
         "excitatory_level": lvl,
     }
     JOBS[job_id] = job
-    
-    # NEW: Route to correct queue
     TASK_QUEUES[lvl].append(job_id)
 
-        # --- v1 SSE notifications (never break scheduling) ---
+    # v1 SSE notifications (never break scheduling)
     try:
-        publish_event("job.updated", {
-            "job_id": job_id,
-            "op": op,
-            "state": "queued",
-            "pinned_agent": pinned_agent,
-            "priority": lvl,
-        })
-        publish_event("queue.updated", {
-            "queue_depth": sum(len(q) for q in TASK_QUEUES.values()),
-        })
+        publish_event(
+            "job.updated",
+            {"job_id": job_id, "op": op, "state": "queued", "pinned_agent": pinned_agent, "priority": lvl},
+        )
+        publish_event("queue.updated", {"queue_depth": sum(len(q) for q in TASK_QUEUES.values())})
     except Exception:
         pass
 
@@ -764,8 +750,7 @@ async def submit_job(request: Request) -> Dict[str, Any]:
         payload = item.get("payload")
         req_job_id = item.get("job_id") or item.get("id")
         req_agent = item.get("agent")
-        
-        # NEW: Parse excitatory level
+
         req_level = item.get("excitatory_level")
         try:
             excitatory_level = int(req_level) if req_level is not None else 1
@@ -785,7 +770,13 @@ async def submit_job(request: Request) -> Dict[str, Any]:
                     )
                 pinned_agent = req_agent
 
-            return _enqueue_job(op=str(op), payload=payload, job_id=req_job_id, pinned_agent=pinned_agent, excitatory_level=excitatory_level)
+            return _enqueue_job(
+                op=str(op),
+                payload=payload,
+                job_id=req_job_id,
+                pinned_agent=pinned_agent,
+                excitatory_level=excitatory_level,
+            )
 
     if isinstance(body, list):
         ids = [_one(it) for it in body]
@@ -796,9 +787,8 @@ async def submit_job(request: Request) -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# Agents (FIXED: warmup on register and after restart-like gaps)
+# Agents
 # -----------------------------------------------------------------------------
-
 @app.post("/agents/register")
 @app.post("/api/agents/register")
 async def register_agent(request: Request) -> Dict[str, Any]:
@@ -836,7 +826,6 @@ async def register_agent(request: Request) -> Dict[str, Any]:
             "metrics": metrics,
             "warmup_until_ts": now + warmup_sec,
         }
-        # init rolling window
         _get_health_window(info)
 
         state, reason = _compute_agent_state(info, now)
@@ -888,10 +877,8 @@ async def agent_heartbeat(request: Request) -> Dict[str, Any]:
         else:
             entry.setdefault("worker_profile", {})
 
-        # ensure rolling window exists
         _get_health_window(entry)
 
-        # If the agent disappeared long enough, treat as restart and re-warm
         try:
             restart_gap = float(WARMUP_POLICY.get("restart_gap_sec", 45.0) or 45.0)
         except (TypeError, ValueError):
@@ -926,7 +913,6 @@ def list_agents() -> Dict[str, Any]:
 
         out = {}
         for name, info in AGENTS.items():
-            # expose rolling window summary (not the whole buffer)
             n, fr = _recent_fail_rate(info)
             out[name] = {
                 "labels": dict(info.get("labels") or {}),
@@ -981,7 +967,6 @@ async def restore_agent(name: str) -> Dict[str, Any]:
         entry.pop("manual_state", None)
         entry.pop("manual_reason", None)
 
-        # Also give it a brief warmup on restore
         try:
             warmup_sec = float(WARMUP_POLICY.get("warmup_sec", 20.0) or 20.0)
         except (TypeError, ValueError):
@@ -1023,7 +1008,6 @@ async def ban_agent(name: str, request: Request) -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 # Health events endpoints
 # -----------------------------------------------------------------------------
-
 @app.get("/events")
 @app.get("/api/events")
 def list_events(limit: int = 200) -> Dict[str, Any]:
@@ -1042,9 +1026,8 @@ def clear_events() -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# Task leasing (FIXED: pinned agent honored + LEASE FIX + EXCITATORY LEVELS)
+# Task leasing
 # -----------------------------------------------------------------------------
-
 @app.get("/task")
 @app.get("/api/task", summary="Agent polls for next task")
 def get_task(agent: str, wait_ms: int = 0):
@@ -1056,7 +1039,7 @@ def get_task(agent: str, wait_ms: int = 0):
 
         if task is not None:
             return JSONResponse(task)
-     
+
         if _now() >= deadline:
             return Response(status_code=204)
 
@@ -1073,24 +1056,21 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
     if state in ("dead", "quarantined", "banned", "stale"):
         return None
 
+    # Cluster-level gating for degraded agents (existing behavior)
     mode = _cluster_policy_mode()
     if state == "degraded" and mode == "aggressive":
         summary = _cluster_health_summary()
         if summary.get("healthy_workers", 0) > 0:
             return None
 
-    # Two-pass selection:
-    #   Pass 1: jobs pinned to this agent (scan high prio -> low prio)
-    #   Pass 2: unpinned jobs (scan high prio -> low prio)
     def _try_pass(require_pinned_match: bool) -> Optional[Dict[str, Any]]:
         global LEASED_TOTAL
         nonlocal now
-        
-        # NEW: Scan Priority Levels High -> Low
+
         for lvl in (3, 2, 1, 0):
             q = TASK_QUEUES[lvl]
             queue_len = len(q)
-            
+
             for _ in range(queue_len):
                 if not q:
                     break
@@ -1100,7 +1080,6 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
                 if not job:
                     continue
 
-                # LEASE FIX: only lease queued jobs (never re-lease leased/completed/failed)
                 if job.get("status") != "queued":
                     continue
 
@@ -1110,19 +1089,25 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
                         q.append(job_id)
                         continue
                 else:
-                    # unpinned only
                     if pinned is not None:
                         q.append(job_id)
                         continue
 
-                payload = job.get("payload")
+                # -----------------------------------------------------------------
+                # BLOCKER FIX: capability gating (op must be supported by agent)
+                # -----------------------------------------------------------------
+                op_name = str(job.get("op") or "unknown")
+                if not _agent_can_run(agent_info, op_name):
+                    # Put it back, this agent can't run it.
+                    q.append(job_id)
+                    continue
 
-                # Scheduling hints are only supported when payload is a dict.
+                payload = job.get("payload")
                 payload_meta = payload if isinstance(payload, dict) else {}
 
+                # Optional scheduling hints
                 prefer_gpu = bool(payload_meta.get("prefer_gpu", False))
                 min_vram_gb = payload_meta.get("min_vram_gb")
-
 
                 if prefer_gpu:
                     wp = agent_info.get("worker_profile") or {}
@@ -1142,46 +1127,36 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
                         if vram < min_v:
                             q.append(job_id)
                             continue
-                    # Lateral inhibition (brainstem)
-                    # Pinned jobs must always win; only gate UNPINNED selection.
-                    if ENABLE_LATERAL_INHIBITION:
-                        op_name = job.get("op") or "unknown"
-                        pinned_agent = job.get("pinned_agent")
 
-                    if pinned_agent is None:
-                        if not BRAIN.allow_lease(
-                            requesting_agent=agent,
-                            op=str(op_name),
-                            now=now,
-                    ):
-                            q.append(job_id)
-                            continue
+                # Lateral inhibition (brainstem)
+                # Only gate UNPINNED selection; pinned jobs always win.
+                if ENABLE_LATERAL_INHIBITION and job.get("pinned_agent") is None:
+                    if not BRAIN.allow_lease(requesting_agent=agent, op=op_name, now=now):
+                        q.append(job_id)
+                        continue
 
+                # Lease it
                 job["status"] = "leased"
                 job["leased_by"] = agent
                 job["leased_ts"] = now
                 LEASED_TOTAL += 1
-                # --- v1 SSE notifications (never break scheduling) ---
+
                 try:
-                    publish_event("job.updated", {
-                        "job_id": job_id,
-                        "op": job.get("op"),
-                        "state": "leased",
-                        "agent": agent,
-                        "priority": job.get("excitatory_level"),
-                    })
-                    publish_event("queue.updated", {
-                        "queue_depth": sum(len(q) for q in TASK_QUEUES.values()),
-                    })
+                    publish_event(
+                        "job.updated",
+                        {
+                            "job_id": job_id,
+                            "op": op_name,
+                            "state": "leased",
+                            "agent": agent,
+                            "priority": job.get("excitatory_level"),
+                        },
+                    )
+                    publish_event("queue.updated", {"queue_depth": sum(len(qq) for qq in TASK_QUEUES.values())})
                 except Exception:
                     pass
-                     
-                return {
-                    "id": job_id,
-                    "job_id": job_id,
-                    "op": job["op"],
-                    "payload": job["payload"],
-                }
+
+                return {"id": job_id, "job_id": job_id, "op": op_name, "payload": job.get("payload")}
 
         return None
 
@@ -1195,7 +1170,6 @@ def _lease_next_job(agent: str) -> Optional[Dict[str, Any]]:
 # -----------------------------------------------------------------------------
 # Results
 # -----------------------------------------------------------------------------
-
 @app.post("/result")
 @app.post("/api/result")
 async def post_result(request: Request) -> Dict[str, Any]:
@@ -1231,20 +1205,16 @@ async def post_result(request: Request) -> Dict[str, Any]:
 
         op = job.get("op") or payload.get("op") or "unknown"
         if duration_ms is not None:
-            OP_COUNTS[op] += 1
-            OP_TOTAL_MS[op] += float(duration_ms)
+            OP_COUNTS[str(op)] += 1
+            OP_TOTAL_MS[str(op)] += float(duration_ms)
 
         agent_name = job.get("leased_by") or payload.get("agent")
 
-        # Controller-maintained per-agent metrics
         if agent_name and agent_name in AGENTS:
             entry = AGENTS[agent_name]
             metrics = entry.get("metrics") or {}
-
-            # Ensure window exists
             _get_health_window(entry)
 
-            # During warmup, do NOT count failures against agent health
             if not _in_warmup(entry, now):
                 if err:
                     metrics["ctrl_tasks_failed"] = int(metrics.get("ctrl_tasks_failed", 0) or 0) + 1
@@ -1254,7 +1224,6 @@ async def post_result(request: Request) -> Dict[str, Any]:
                     metrics["ctrl_tasks_completed"] = int(metrics.get("ctrl_tasks_completed", 0) or 0) + 1
                     _record_outcome(entry, failed=False)
             else:
-                # Keep warmup neutral, but still record successes (helps window fill without punishing)
                 if not err:
                     metrics["ctrl_tasks_completed"] = int(metrics.get("ctrl_tasks_completed", 0) or 0) + 1
                     _record_outcome(entry, failed=False)
@@ -1279,12 +1248,12 @@ async def post_result(request: Request) -> Dict[str, Any]:
             state, reason = _compute_agent_state(entry, now)
             _set_agent_health(agent_name, entry, state, reason, now)
 
-        if not err and op == "risk_accumulate":
+        if not err and str(op) == "risk_accumulate":
             _ingest_risk_accumulate_result(
                 result=result,
-                job_id=job_id,
+                job_id=str(job_id),
                 agent=agent_name,
-                op=op,
+                op=str(op),
                 now=now,
             )
 
@@ -1297,16 +1266,19 @@ async def post_result(request: Request) -> Dict[str, Any]:
             job["result"] = result
             COMPLETED_TOTAL += 1
             COMPLETION_TIMES.append(now)
-                # --- v1 SSE notifications (never break scheduling) ---
+
         try:
             v1_state = "succeeded" if job.get("status") == "completed" else job.get("status")
-            publish_event("job.updated", {
-                "job_id": job_id,
-                "op": op,
-                "state": v1_state,
-                "agent": job.get("leased_by"),
-                "duration_ms": job.get("duration_ms"),
-            })
+            publish_event(
+                "job.updated",
+                {
+                    "job_id": job_id,
+                    "op": str(op),
+                    "state": v1_state,
+                    "agent": job.get("leased_by"),
+                    "duration_ms": job.get("duration_ms"),
+                },
+            )
         except Exception:
             pass
 
@@ -1314,9 +1286,8 @@ async def post_result(request: Request) -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# Jobs / reporting (FIXED: results filter)
+# Jobs / reporting
 # -----------------------------------------------------------------------------
-
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str) -> Dict[str, Any]:
     with STATE_LOCK:
@@ -1365,7 +1336,6 @@ def stats() -> Dict[str, Any]:
         _refresh_agent_states(now)
 
         agents_online = len(AGENTS)
-        # NEW: Sum all queue lengths
         queue_len = sum(len(q) for q in TASK_QUEUES.values())
         leased_total = LEASED_TOTAL
         completed_total = COMPLETED_TOTAL
@@ -1412,10 +1382,7 @@ def stats() -> Dict[str, Any]:
         "rate_5m": rate_5m,
         "rate_15m": rate_15m,
         "op_counts": dict(OP_COUNTS),
-        "op_avg_ms": {
-            op: (OP_TOTAL_MS[op] / count) if count > 0 else 0.0
-            for op, count in OP_COUNTS.items()
-        },
+        "op_avg_ms": {op: (OP_TOTAL_MS[op] / count) if count > 0 else 0.0 for op, count in OP_COUNTS.items()},
         "agent_states": dict(agent_states),
         "gpu_agents_online": gpu_agents_online,
         "total_gpu_vram_gb": total_gpu_vram_gb,
@@ -1453,17 +1420,13 @@ def stats_sparkline() -> Dict[str, Any]:
 def stats_ops() -> Dict[str, Any]:
     with STATE_LOCK:
         op_counts = dict(OP_COUNTS)
-        op_avg_ms = {
-            op: (OP_TOTAL_MS[op] / count) if count > 0 else 0.0
-            for op, count in OP_COUNTS.items()
-        }
+        op_avg_ms = {op: (OP_TOTAL_MS[op] / count) if count > 0 else 0.0 for op, count in OP_COUNTS.items()}
     return {"op_counts": op_counts, "op_avg_ms": op_avg_ms}
 
 
 # -----------------------------------------------------------------------------
 # Intake / pipelines (digestion slice v1)
 # -----------------------------------------------------------------------------
-
 async def _run_pipeline_run(run_id: str, req: IntakeRequest) -> None:
     now = _now()
     with STATE_LOCK:
@@ -1556,7 +1519,6 @@ def get_pipeline(run_id: str) -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 # Seeding / purge
 # -----------------------------------------------------------------------------
-
 @app.post("/seed")
 @app.post("/api/seed")
 async def seed(request: Request) -> Dict[str, Any]:
@@ -1577,22 +1539,20 @@ async def seed(request: Request) -> Dict[str, Any]:
 
 @app.post("/purge")
 def purge() -> Dict[str, Any]:
-    global JOBS, TASK_QUEUES, LEASED_TOTAL, COMPLETED_TOTAL, FAILED_TOTAL
+    global JOBS, LEASED_TOTAL, COMPLETED_TOTAL, FAILED_TOTAL
     global COMPLETION_TIMES, OP_COUNTS, OP_TOTAL_MS
-    global RISK_STATE, PIPELINES, HEALTH_EVENTS  # NEW: Added PIPELINES and HEALTH_EVENTS
+    global RISK_STATE, PIPELINES, HEALTH_EVENTS
 
     with STATE_LOCK:
         JOBS = {}
-        
-        # CORRECTED: Do NOT re-bind TASK_QUEUES. 
-        # Clear the deque objects in-place so TASK_QUEUE alias remains valid.
+
+        # Do NOT re-bind TASK_QUEUES; clear in place so TASK_QUEUE alias stays valid.
         for q in TASK_QUEUES.values():
             q.clear()
-            
-        # NEW: Clear pipelines and health events for a true purge
+
         PIPELINES = {}
         HEALTH_EVENTS = []
-            
+
         LEASED_TOTAL = 0
         COMPLETED_TOTAL = 0
         FAILED_TOTAL = 0
