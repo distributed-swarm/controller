@@ -729,7 +729,22 @@ def _enqueue_job(op: str, payload: Dict[str, Any], job_id: Optional[str] = None,
     
     # NEW: Route to correct queue
     TASK_QUEUES[lvl].append(job_id)
-    
+
+        # --- v1 SSE notifications (never break scheduling) ---
+    try:
+        publish_event("job.updated", {
+            "job_id": job_id,
+            "op": op,
+            "state": "queued",
+            "pinned_agent": pinned_agent,
+            "priority": lvl,
+        })
+        publish_event("queue.updated", {
+            "queue_depth": sum(len(q) for q in TASK_QUEUES.values()),
+        })
+    except Exception:
+        pass
+
     return job_id
 
 
