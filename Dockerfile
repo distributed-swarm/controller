@@ -17,6 +17,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy controller code (includes app.py, pipelines/, connectors/, etc.)
 COPY . /app
 
+# Fail the build if imports are broken
+RUN python -c "from api.v1 import router; print('api.v1.router OK')"
+RUN python -c "import app; print('app OK:', app.__file__)"
+
 # Healthcheck
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD curl -fsS http://0.0.0.0:8080/healthz || exit 1
