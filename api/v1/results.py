@@ -71,13 +71,32 @@ def post_result(req: ResultRequest) -> ResultResponse:
                 lease_id=req.lease_id,
             )
             return ResultResponse(ok=True)
+
         except TypeError:
-            # Fallback: some implementations may not accept lease_id, or use different arg order
+            # Controller implementations vary. Some accept a single payload dict, some accept
+            # positional args. Try single-dict first, then a minimal positional fallback.
+            payload = {
+                "lease_id": req.lease_id,
+                "job_id": req.job_id,
+                "status": internal_status,
+                "result": req.result,
+                "error": req.error,
+            }
+
+            # First: single-argument dict (matches your controller's post_result signature)
             try:
-                result_fn(req.job_id, internal_status, req.result, req.error)
+                result_fn(payload)
                 return ResultResponse(ok=True)
+            except TypeError:
+                # Last resort: old positional style (job_id, status, result, error)
+                try:
+                    result_fn(req.job_id, internal_status, req.result, req.error)
+                    return ResultResponse(ok=True)
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=f"Failed to record result: {e}")
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Failed to record result: {e}")
+
         except HTTPException:
             raise
         except Exception as e:
@@ -113,4 +132,3 @@ def post_result(req: ResultRequest) -> ResultResponse:
     job.setdefault("lease_id", req.lease_id)
 
     return ResultResponse(ok=True)
-
