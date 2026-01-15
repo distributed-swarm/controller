@@ -19,7 +19,10 @@ _IDEMPOTENCY_LOCK = threading.Lock()
 
 class JobSubmitRequest(BaseModel):
     op: str = Field(..., description="Operation name (e.g. 'echo', 'hailo_infer', 'map_summarize').")
-    payload: Any = Field(default_factory=dict, description="Operation payload (JSON object).")
+
+    # Back-compat: allow any JSON value, not just objects/dicts.
+    # Legacy /job accepted strings and other JSON scalars.
+    payload: Any = Field(default_factory=dict, description="Operation payload (any JSON value).")
 
     # Optional scheduling knobs
     constraints: Optional[Dict[str, Any]] = Field(
@@ -76,10 +79,20 @@ def submit_job(req: JobSubmitRequest) -> JobSubmitResponse:
             detail=f"Runtime enqueue function not available: {e}",
         )
 
-    # Pass constraints through for now (store inside payload so it's not lost)
-    payload = dict(req.payload or {})
+    # Back-compat payload handling:
+    # - Accept dict/list/string/number/etc.
+    # - Preserve constraints:
+    #   - If payload is a dict, inject _constraints
+    #   - Otherwise wrap as {"value": payload, "_constraints": constraints}
+    payload: Any = req.payload
+    if payload is None:
+        payload = {}
+
     if req.constraints is not None:
-        payload.setdefault("_constraints", req.constraints)
+        if isinstance(payload, dict):
+            payload.setdefault("_constraints", req.constraints)
+        else:
+            payload = {"value": payload, "_constraints": req.constraints}
 
     try:
         _enqueue_job(
@@ -103,4 +116,3 @@ def submit_job(req: JobSubmitRequest) -> JobSubmitResponse:
             _IDEMPOTENCY[req.idempotency_key] = job_id
 
     return JobSubmitResponse(job_id=job_id)
-
