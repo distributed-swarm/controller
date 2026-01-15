@@ -77,7 +77,7 @@ def _load_stores() -> Tuple[Dict[str, Any], Dict[str, Any]]:
     Pull in-memory stores from controller.app.
     """
     try:
-        import controller.app as app  # type: ignore
+        import app as app  # type: ignore
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Controller module not available: {e}")
 
