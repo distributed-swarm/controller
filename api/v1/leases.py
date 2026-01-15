@@ -14,9 +14,22 @@ router = APIRouter()
 
 class LeaseRequest(BaseModel):
     agent: str = Field(..., description="Agent name/id (e.g. 'cpu-1').")
-    capabilities: List[str] = Field(default_factory=list, description="Ops this agent can run (future-proofing).")
-    max_tasks: int = Field(default=1, ge=1, le=64, description="Max tasks to lease in one call.")
-    timeout_ms: int = Field(default=25000, ge=0, le=120000, description="Long-poll timeout in milliseconds.")
+    capabilities: List[str] = Field(
+        default_factory=list,
+        description="Ops this agent can run (future-proofing).",
+    )
+    max_tasks: int = Field(
+        default=1,
+        ge=1,
+        le=64,
+        description="Max tasks to lease in one call.",
+    )
+    timeout_ms: int = Field(
+        default=25000,
+        ge=0,
+        le=120000,
+        description="Long-poll timeout in milliseconds.",
+    )
 
 
 class LeaseTask(BaseModel):
@@ -47,6 +60,46 @@ def _normalize_job(job: Dict[str, Any]) -> LeaseTask:
     )
 
 
+def _job_allows_agent(job: Dict[str, Any], agent_name: str) -> bool:
+    """
+    Ensure pinned jobs never get returned to the wrong agent.
+    (This is a safety net in case the underlying leasing function is permissive.)
+    """
+    pinned = job.get("pinned_agent") or job.get("pinnedAgent")
+    if pinned and str(pinned) != str(agent_name):
+        return False
+    return True
+
+
+def _publish_job_leased_event(job: Dict[str, Any], lease_id: str, agent: str) -> None:
+    """
+    Best-effort: emit job.leased to SSE. This must never break leasing.
+    """
+    try:
+        from api.v1.events import publish_event  # deferred to avoid circular imports
+    except Exception:
+        return
+
+    job_id = job.get("job_id") or job.get("id") or job.get("jobId")
+    op = job.get("op") or job.get("type") or job.get("job_type") or job.get("jobType")
+    pinned = job.get("pinned_agent") or job.get("pinnedAgent")
+
+    try:
+        publish_event(
+            "job.leased",
+            {
+                "job_id": str(job_id) if job_id is not None else None,
+                "lease_id": str(lease_id),
+                "agent": str(agent),
+                "op": str(op) if op is not None else None,
+                "pinned_agent": str(pinned) if pinned is not None else None,
+            },
+        )
+    except Exception:
+        # Never fail the lease call because SSE/event plumbing had a bad day.
+        return
+
+
 @router.post("/leases", response_model=LeaseResponse, responses={204: {"description": "No work available"}})
 def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
     """
@@ -65,34 +118,51 @@ def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
 
     deadline = time.time() + (req.timeout_ms / 1000.0 if req.timeout_ms else 0.0)
     tasks: List[LeaseTask] = []
+    lease_id = str(uuid.uuid4())
 
     def try_lease_once() -> Optional[Dict[str, Any]]:
         try:
+            # Note: capabilities currently unused here; underlying scheduler may evolve.
             return _lease_next_job(req.agent)
         except HTTPException:
             raise
         except Exception as e:
-            # If leasing fails, that's a controller bug or agent state issue.
             raise HTTPException(status_code=500, detail=f"Leasing failed: {e}")
 
-    # Fast path: timeout_ms == 0 => one attempt and return immediately.
-    if req.timeout_ms == 0:
-        job = try_lease_once()
-        if not job:
-            return Response(status_code=204)
-        tasks.append(_normalize_job(job))
-        return LeaseResponse(lease_id=str(uuid.uuid4()), tasks=tasks)
-
-    # Long-poll loop
-    while True:
+    def drain_available_work_once() -> None:
+        """
+        Attempt to lease up to max_tasks immediately (no sleeping inside).
+        Applies pinned-agent safety check.
+        """
         while len(tasks) < req.max_tasks:
             job = try_lease_once()
             if not job:
                 break
+
+            # Safety: never hand a pinned job to the wrong agent.
+            if not _job_allows_agent(job, req.agent):
+                # If underlying leasing already marked it leased, that's a bug upstream.
+                # We refuse to return it to the wrong agent and keep polling.
+                break
+
+            # Normalize and append
             tasks.append(_normalize_job(job))
 
+            # Emit SSE event (best-effort)
+            _publish_job_leased_event(job, lease_id=lease_id, agent=req.agent)
+
+    # Fast path: timeout_ms == 0 => one attempt and return immediately.
+    if req.timeout_ms == 0:
+        drain_available_work_once()
+        if not tasks:
+            return Response(status_code=204)
+        return LeaseResponse(lease_id=lease_id, tasks=tasks)
+
+    # Long-poll loop
+    while True:
+        drain_available_work_once()
         if tasks:
-            return LeaseResponse(lease_id=str(uuid.uuid4()), tasks=tasks)
+            return LeaseResponse(lease_id=lease_id, tasks=tasks)
 
         if time.time() >= deadline:
             return Response(status_code=204)
