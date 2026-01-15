@@ -69,7 +69,7 @@ def submit_job(req: JobSubmitRequest) -> JobSubmitResponse:
     # Defer importing controller internals to avoid circular imports until we wire everything.
     try:
         # Expectation: controller exposes _enqueue_job(op, payload, job_id=None, pinned_agent=None, excitatory_level=1)
-        from controller.app import _enqueue_job  # type: ignore
+        from app import _enqueue_job  # type: ignore
     except Exception as e:
         raise HTTPException(
             status_code=500,
