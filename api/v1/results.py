@@ -50,7 +50,7 @@ def post_result(req: ResultRequest) -> ResultResponse:
     try:
         import app as app  # type: ignore
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Controller module not available: {e}")
+        raise HTTPException(status_code=500, detail=f"Runtime module 'app' not available: {e}")
 
     # 1) If controller provides a dedicated result function, use it.
     # We try a few likely names so we don't have to refactor your old code immediately.
