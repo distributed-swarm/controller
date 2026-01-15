@@ -19,7 +19,7 @@ _IDEMPOTENCY_LOCK = threading.Lock()
 
 class JobSubmitRequest(BaseModel):
     op: str = Field(..., description="Operation name (e.g. 'echo', 'hailo_infer', 'map_summarize').")
-    payload: Dict[str, Any] = Field(default_factory=dict, description="Operation payload (JSON object).")
+    payload: Any = Field(default_factory=dict, description="Operation payload (JSON object).")
 
     # Optional scheduling knobs
     constraints: Optional[Dict[str, Any]] = Field(
