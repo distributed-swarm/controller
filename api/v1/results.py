@@ -48,7 +48,7 @@ def post_result(req: ResultRequest) -> ResultResponse:
 
     # Prefer calling an existing controller function if one exists
     try:
-        import controller.app as app  # type: ignore
+        import app as app  # type: ignore
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Controller module not available: {e}")
 
