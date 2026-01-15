@@ -73,7 +73,7 @@ def submit_job(req: JobSubmitRequest) -> JobSubmitResponse:
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Controller enqueue function not available: {e}",
+            detail=f"Runtime enqueue function not available: {e}",
         )
 
     # Pass constraints through for now (store inside payload so it's not lost)
