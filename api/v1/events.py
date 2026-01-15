@@ -15,13 +15,18 @@ router = APIRouter()
 _SUBSCRIBERS: List[asyncio.Queue] = []
 _SUBSCRIBERS_LOCK = asyncio.Lock()
 
+# Main event loop reference (used to publish from sync/threadpool contexts)
+_MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
 # How often to send keepalive comments (seconds)
 _KEEPALIVE_INTERVAL_S = 15.0
 
 
 def _sse_format(event_type: str, data: Dict[str, Any]) -> str:
-    # SSE format: event + data + blank line
-    # data must be a single line; JSON dumps is fine
+    """
+    SSE format: event + data + blank line.
+    'data:' must be single-line. JSON dumps is fine.
+    """
     payload = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
     return f"event: {event_type}\ndata: {payload}\n\n"
 
@@ -42,48 +47,77 @@ async def _remove_subscriber(q: asyncio.Queue) -> None:
 async def _broadcast(msg: str) -> None:
     """
     Fan-out message to all subscribers.
-    If a queue is full/unresponsive, we drop the message for that subscriber.
+    If a queue is full/unresponsive, drop the message for that subscriber.
     """
+    # Copy subscribers under lock, then fan-out without holding the lock.
     async with _SUBSCRIBERS_LOCK:
-        for q in list(_SUBSCRIBERS):
-            try:
-                q.put_nowait(msg)
-            except asyncio.QueueFull:
-                # Drop rather than blocking the controller
-                pass
+        subscribers = list(_SUBSCRIBERS)
+
+    for q in subscribers:
+        try:
+            q.put_nowait(msg)
+        except asyncio.QueueFull:
+            pass
 
 
 def publish_event(event_type: str, data: Dict[str, Any]) -> None:
     """
     Publish an SSE event to all connected clients.
 
-    Safe to call from sync FastAPI endpoints:
-    - If we're not in an event loop, it schedules on the current loop when available.
-    - If no loop is running (rare in ASGI), we simply no-op rather than crashing.
+    Safe to call from:
+    - async endpoints (has running loop)
+    - sync endpoints (threadpool; no running loop)
+
+    Best-effort: if no loop exists yet (no /events clients connected),
+    it no-ops rather than crashing.
     """
+    global _MAIN_LOOP
+
     msg = _sse_format(event_type, data)
 
+    # Fast exit: nothing to do if nobody is listening.
+    # (Also avoids doing loop scheduling work when unused.)
+    try:
+        # Avoid locking here; worst case we schedule broadcast and it finds nobody.
+        if not _SUBSCRIBERS:
+            return
+    except Exception:
+        # If something weird happens, keep best-effort behavior.
+        return
+
+    # If we're already on an event loop (async context), schedule directly.
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(_broadcast(msg))
+        return
     except RuntimeError:
-        # No running loop (e.g., called from a sync context without loop)
-        # We avoid crashing; the event just won't be broadcast.
-        # When we wire the app with UvicornWorker, the loop will exist.
+        pass  # Not in an event loop (likely threadpool)
+
+    # Threadpool / sync context path: schedule on the main loop if we have it.
+    if _MAIN_LOOP is None:
+        return
+
+    try:
+        _MAIN_LOOP.call_soon_threadsafe(asyncio.create_task, _broadcast(msg))
+    except Exception:
+        # Don't ever break API calls because SSE had a bad day.
         return
 
 
 @router.get("/events")
 async def sse_events(request: Request) -> StreamingResponse:
     """
-    SSE stream emitting:
-      - job.updated
-      - agent.updated
-      - queue.updated
+    SSE stream emitting events (e.g., job.created, job.leased, job.completed)
     plus keepalive pings.
     """
-    q: asyncio.Queue = asyncio.Queue(maxsize=100)
+    global _MAIN_LOOP
+    try:
+        _MAIN_LOOP = asyncio.get_running_loop()
+    except Exception:
+        # In practice, this should always succeed in ASGI.
+        pass
 
+    q: asyncio.Queue = asyncio.Queue(maxsize=200)
     await _add_subscriber(q)
 
     async def event_generator():
@@ -94,11 +128,9 @@ async def sse_events(request: Request) -> StreamingResponse:
 
         try:
             while True:
-                # Client disconnected?
                 if await request.is_disconnected():
                     break
 
-                # Wait for next message, but wake up periodically for keepalive
                 timeout = max(0.1, _KEEPALIVE_INTERVAL_S - (time.time() - last_keepalive))
                 try:
                     msg = await asyncio.wait_for(q.get(), timeout=timeout)
@@ -114,8 +146,7 @@ async def sse_events(request: Request) -> StreamingResponse:
         event_generator(),
         media_type="text/event-stream",
         headers={
-            # Helps with reverse proxies buffering (nginx)
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
+            "X-Accel-Buffering": "no",  # helps reverse proxies not buffer SSE
         },
     )
