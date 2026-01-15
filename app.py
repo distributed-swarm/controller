@@ -456,13 +456,43 @@ def _agent_ops(agent_info: Dict[str, Any]) -> set:
         return {ops}
     return set()
 
-
 def _agent_can_run(agent_info: Dict[str, Any], op: str) -> bool:
-    try:
-        return str(op) in _agent_ops(agent_info)
-    except Exception:
-        return False
+    """Return True if the agent is allowed to run the given op.
 
+    Back-compat / rollout behavior:
+    - If the agent has NOT registered yet, or does NOT advertise capabilities.ops,
+      we DO NOT block leasing (allow all ops).
+    - We only gate when ops are explicitly provided.
+    """
+    try:
+        caps = agent_info.get("capabilities") or {}
+
+        # Fail-open if ops gating is not explicitly configured.
+        if "ops" not in caps:
+            return True
+
+        ops_val = caps.get("ops")
+
+        # Treat missing/empty ops as "no gating"
+        if ops_val is None:
+            return True
+        if isinstance(ops_val, (list, dict)) and len(ops_val) == 0:
+            return True
+        if isinstance(ops_val, str) and ops_val.strip() == "":
+            return True
+
+        op_name = str(op)
+        ops = _agent_ops(agent_info)
+
+        # Optional wildcard support
+        if "*" in ops:
+            return True
+
+        return op_name in ops
+
+    except Exception:
+        # Never fail closed because of controller-side parsing issues.
+        return True
 
 # -----------------------------------------------------------------------------
 # Lease reaper
