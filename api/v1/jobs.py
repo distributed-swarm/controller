@@ -65,15 +65,15 @@ def _publish_job_created_event(job_id: str, req: JobSubmitRequest, payload: Any)
     except Exception:
         return
 
+    # Avoid leaking huge payloads into SSE; only send a tiny preview.
+    payload_preview = None
     try:
-        # Avoid leaking huge payloads into SSE; only send a tiny preview.
-        payload_preview = None
-        try:
-            if payload is not None:
-                payload_preview = str(payload)[:100]
-        except Exception:
-            payload_preview = "<unprintable>"
+        if payload is not None:
+            payload_preview = str(payload)[:100]
+    except Exception:
+        payload_preview = "<unprintable>"
 
+    try:
         publish_event(
             "job.created",
             {
@@ -89,7 +89,6 @@ def _publish_job_created_event(job_id: str, req: JobSubmitRequest, payload: Any)
         )
     except Exception:
         return
-
 
 
 @router.post("/jobs", response_model=JobSubmitResponse)
@@ -144,12 +143,14 @@ def submit_job(req: JobSubmitRequest) -> JobSubmitResponse:
             pinned_agent=req.pinned_agent,
             excitatory_level=req.priority if req.priority is not None else 1,
         )
-    except TypeError:
+    except TypeError as e:
         # If the controller signature differs, fall back to positional call with safest ordering.
+        # Log this so we don't silently hide real bugs during migration.
+        print(f"WARNING: _enqueue_job signature mismatch: {e}")
         try:
             _enqueue_job(req.op, payload, job_id, req.pinned_agent, req.priority if req.priority is not None else 1)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to enqueue job: {e}")
+        except Exception as e2:
+            raise HTTPException(status_code=500, detail=f"Failed to enqueue job: {e2}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to enqueue job: {e}")
 
