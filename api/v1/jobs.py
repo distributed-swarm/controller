@@ -66,21 +66,30 @@ def _publish_job_created_event(job_id: str, req: JobSubmitRequest, payload: Any)
         return
 
     try:
+        # Avoid leaking huge payloads into SSE; only send a tiny preview.
+        payload_preview = None
+        try:
+            if payload is not None:
+                payload_preview = str(payload)[:100]
+        except Exception:
+            payload_preview = "<unprintable>"
+
         publish_event(
             "job.created",
             {
                 "job_id": job_id,
                 "op": req.op,
+                "state": "queued",
                 "priority": req.priority if req.priority is not None else 1,
                 "constraints": req.constraints,
                 "pinned_agent": req.pinned_agent,
-                # Keep payload light; but for a demo it's useful to have *something*.
-                # If your payloads get huge, strip this down further.
+                "payload_preview": payload_preview,
                 "created_at": _now_iso(),
             },
         )
     except Exception:
         return
+
 
 
 @router.post("/jobs", response_model=JobSubmitResponse)
