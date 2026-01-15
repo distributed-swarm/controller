@@ -27,6 +27,39 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _publish_job_completed_event(
+    *,
+    job_id: str,
+    lease_id: str,
+    status_norm: str,
+    agent: Optional[str],
+    error: Optional[Any],
+) -> None:
+    """
+    Best-effort: emit job.completed to SSE. Must never break result posting.
+    """
+    try:
+        from api.v1.events import publish_event  # deferred to avoid circular imports
+    except Exception:
+        return
+
+    try:
+        publish_event(
+            "job.completed",
+            {
+                "job_id": job_id,
+                "lease_id": lease_id,
+                "agent": agent,
+                # v1 caller uses succeeded/failed; keep that externally (demo-friendly).
+                "status": status_norm,
+                "error": error,
+                "completed_at": _now_iso(),
+            },
+        )
+    except Exception:
+        return
+
+
 def _force_transition_job(job: Dict[str, Any], *, internal_status: str, req: ResultRequest) -> None:
     """
     Force the job dict into a terminal state, using the controller's timestamp conventions.
@@ -70,6 +103,19 @@ def _job_is_terminal(job: Dict[str, Any]) -> bool:
     return s in ("completed", "failed", "succeeded")  # tolerate both vocabularies
 
 
+def _infer_agent_from_job(job: Optional[Dict[str, Any]]) -> Optional[str]:
+    """
+    Best effort: if the controller stores leased_by / agent info on the job, surface it.
+    """
+    if not isinstance(job, dict):
+        return None
+    for k in ("leased_by", "agent", "agent_id", "worker", "worker_id"):
+        v = job.get(k)
+        if v:
+            return str(v)
+    return None
+
+
 @router.post("/results", response_model=ResultResponse)
 def post_result(req: ResultRequest) -> ResultResponse:
     """
@@ -104,6 +150,8 @@ def post_result(req: ResultRequest) -> ResultResponse:
         if isinstance(maybe, dict):
             job = maybe
             if _job_is_terminal(job):
+                # Emit event even on idempotent repeats? Usually no.
+                # We'll avoid double-firing completed events.
                 return ResultResponse(ok=True)
 
     # Try calling an existing controller result function if one exists.
@@ -115,14 +163,6 @@ def post_result(req: ResultRequest) -> ResultResponse:
             break
 
     if callable(result_fn):
-        payload: Dict[str, Any] = {
-            "lease_id": req.lease_id,
-            "job_id": req.job_id,
-            "status": internal_status,
-            "result": req.result,
-            "error": req.error,
-        }
-
         # Attempt 1: keyword args
         try:
             result_fn(
@@ -135,6 +175,13 @@ def post_result(req: ResultRequest) -> ResultResponse:
         except TypeError:
             # Attempt 2: single payload dict (this matches your current controller signature)
             try:
+                payload: Dict[str, Any] = {
+                    "lease_id": req.lease_id,
+                    "job_id": req.job_id,
+                    "status": internal_status,
+                    "result": req.result,
+                    "error": req.error,
+                }
                 result_fn(payload)
             except TypeError:
                 # Attempt 3: positional fallback (job_id, status, result, error)
@@ -149,11 +196,21 @@ def post_result(req: ResultRequest) -> ResultResponse:
 
         # Truthfulness: ensure the job actually transitioned. If not, force it.
         if isinstance(jobs, dict):
-            maybe = jobs.get(req.job_id)
-            if isinstance(maybe, dict) and not _job_is_terminal(maybe):
-                # If it's still leased after "success", fix it.
-                _force_transition_job(maybe, internal_status=internal_status, req=req)
+            maybe2 = jobs.get(req.job_id)
+            if isinstance(maybe2, dict) and not _job_is_terminal(maybe2):
+                _force_transition_job(maybe2, internal_status=internal_status, req=req)
+                job = maybe2
+            elif isinstance(maybe2, dict):
+                job = maybe2
 
+        # Emit SSE completed event (best-effort)
+        _publish_job_completed_event(
+            job_id=req.job_id,
+            lease_id=req.lease_id,
+            status_norm=status_norm,
+            agent=_infer_agent_from_job(job),
+            error=req.error if status_norm == "failed" else None,
+        )
         return ResultResponse(ok=True)
 
     # No controller function available => update in-memory JOBS directly.
@@ -168,4 +225,13 @@ def post_result(req: ResultRequest) -> ResultResponse:
         return ResultResponse(ok=True)
 
     _force_transition_job(job2, internal_status=internal_status, req=req)
+
+    # Emit SSE completed event (best-effort)
+    _publish_job_completed_event(
+        job_id=req.job_id,
+        lease_id=req.lease_id,
+        status_norm=status_norm,
+        agent=_infer_agent_from_job(job2),
+        error=req.error if status_norm == "failed" else None,
+    )
     return ResultResponse(ok=True)
