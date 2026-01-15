@@ -42,7 +42,7 @@ def lease_work(req: LeaseRequest, response: Response) -> LeaseResponse:
     """
     # Defer import to avoid circular wiring issues while we build v1.
     try:
-        from controller.app import _lease_next_job  # type: ignore
+        from app import _lease_next_job  # type: ignore
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Controller lease function not available: {e}")
 
