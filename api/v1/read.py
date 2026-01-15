@@ -70,16 +70,18 @@ def _job_matches_filters(
             return False
 
     return True
-
-
+    
 def _load_stores() -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    Pull in-memory stores from controller.app.
+    Pull in-memory stores from the running app.py module.
     """
     try:
         import app as app  # type: ignore
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Controller module not available: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Runtime module 'app' not available: {e}",
+        )
 
     jobs = getattr(app, "JOBS", None)
     agents = getattr(app, "AGENTS", None)
