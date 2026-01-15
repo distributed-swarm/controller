@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -51,6 +52,37 @@ class JobSubmitResponse(BaseModel):
     job_id: str
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _publish_job_created_event(job_id: str, req: JobSubmitRequest, payload: Any) -> None:
+    """
+    Best-effort: emit job.created to SSE. Must never break job submission.
+    """
+    try:
+        from api.v1.events import publish_event  # deferred to avoid circular imports
+    except Exception:
+        return
+
+    try:
+        publish_event(
+            "job.created",
+            {
+                "job_id": job_id,
+                "op": req.op,
+                "priority": req.priority if req.priority is not None else 1,
+                "constraints": req.constraints,
+                "pinned_agent": req.pinned_agent,
+                # Keep payload light; but for a demo it's useful to have *something*.
+                # If your payloads get huge, strip this down further.
+                "created_at": _now_iso(),
+            },
+        )
+    except Exception:
+        return
+
+
 @router.post("/jobs", response_model=JobSubmitResponse)
 def submit_job(req: JobSubmitRequest) -> JobSubmitResponse:
     """
@@ -59,6 +91,7 @@ def submit_job(req: JobSubmitRequest) -> JobSubmitResponse:
     Logic:
     - If idempotency_key is provided and we've seen it, return the same job_id.
     - Otherwise generate a job_id and enqueue the job via the controller's existing enqueue function.
+    - Emit SSE event: job.created (best-effort).
     """
     # Idempotency: same key => same job_id
     if req.idempotency_key:
@@ -114,5 +147,8 @@ def submit_job(req: JobSubmitRequest) -> JobSubmitResponse:
     if req.idempotency_key:
         with _IDEMPOTENCY_LOCK:
             _IDEMPOTENCY[req.idempotency_key] = job_id
+
+    # Best-effort SSE event
+    _publish_job_created_event(job_id=job_id, req=req, payload=payload)
 
     return JobSubmitResponse(job_id=job_id)
