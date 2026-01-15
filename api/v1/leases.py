@@ -5,7 +5,8 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 router = APIRouter()
@@ -21,7 +22,8 @@ class LeaseRequest(BaseModel):
 class LeaseTask(BaseModel):
     job_id: str
     op: str
-    payload: Dict[str, Any] = Field(default_factory=dict)
+    # Back-compat: payload may be any JSON value, not only dicts.
+    payload: Any = Field(default_factory=dict)
     pinned_agent: Optional[str] = None
 
 
@@ -30,15 +32,30 @@ class LeaseResponse(BaseModel):
     tasks: List[LeaseTask]
 
 
+def _normalize_job(job: Dict[str, Any]) -> LeaseTask:
+    job_id = job.get("job_id") or job.get("id") or job.get("jobId")
+    op = job.get("op") or job.get("type") or job.get("job_type") or job.get("jobType")
+
+    if not job_id or not op:
+        raise HTTPException(status_code=500, detail=f"Invalid leased job shape: {job}")
+
+    return LeaseTask(
+        job_id=str(job_id),
+        op=str(op),
+        payload=job.get("payload"),
+        pinned_agent=job.get("pinned_agent") or job.get("pinnedAgent"),
+    )
+
+
 @router.post("/leases", response_model=LeaseResponse, responses={204: {"description": "No work available"}})
-def lease_work(req: LeaseRequest, response: Response) -> LeaseResponse:
+def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
     """
     Lease work for an agent.
 
     Behavior:
     - Long-polls up to timeout_ms.
     - Tries to lease up to max_tasks jobs.
-    - Returns 204 if no work is available by timeout.
+    - Returns 204 with empty body if no work is available by timeout.
     """
     # Defer import to avoid circular wiring issues while we build v1.
     try:
@@ -47,66 +64,37 @@ def lease_work(req: LeaseRequest, response: Response) -> LeaseResponse:
         raise HTTPException(status_code=500, detail=f"Controller lease function not available: {e}")
 
     deadline = time.time() + (req.timeout_ms / 1000.0 if req.timeout_ms else 0.0)
-    leased: List[LeaseTask] = []
+    tasks: List[LeaseTask] = []
 
-    # Helper to attempt one lease
     def try_lease_once() -> Optional[Dict[str, Any]]:
         try:
             return _lease_next_job(req.agent)
+        except HTTPException:
+            raise
         except Exception as e:
             # If leasing fails, that's a controller bug or agent state issue.
             raise HTTPException(status_code=500, detail=f"Leasing failed: {e}")
 
-    # Fast path: if timeout_ms == 0, we try once and return immediately.
+    # Fast path: timeout_ms == 0 => one attempt and return immediately.
     if req.timeout_ms == 0:
         job = try_lease_once()
         if not job:
-            response.status_code = 204
-            # FastAPI requires returning something matching response_model unless we short-circuit.
-            raise HTTPException(status_code=204, detail="No work available")
-        leased.append(
-            LeaseTask(
-                job_id=job.get("job_id") or job.get("id") or job.get("jobId"),
-                op=job.get("op") or job.get("type") or job.get("job_type"),
-                payload=job.get("payload") or {},
-                pinned_agent=job.get("pinned_agent"),
-            )
-        )
-        return LeaseResponse(lease_id=str(uuid.uuid4()), tasks=leased)
+            return Response(status_code=204)
+        tasks.append(_normalize_job(job))
+        return LeaseResponse(lease_id=str(uuid.uuid4()), tasks=tasks)
 
     # Long-poll loop
     while True:
-        # Lease up to max_tasks
-        while len(leased) < req.max_tasks:
+        while len(tasks) < req.max_tasks:
             job = try_lease_once()
             if not job:
                 break
+            tasks.append(_normalize_job(job))
 
-            job_id = job.get("job_id") or job.get("id") or job.get("jobId")
-            op = job.get("op") or job.get("type") or job.get("job_type")
-            if not job_id or not op:
-                # Defensive: controller returned something weird
-                raise HTTPException(status_code=500, detail=f"Invalid leased job shape: {job}")
+        if tasks:
+            return LeaseResponse(lease_id=str(uuid.uuid4()), tasks=tasks)
 
-            leased.append(
-                LeaseTask(
-                    job_id=job_id,
-                    op=op,
-                    payload=job.get("payload") or {},
-                    pinned_agent=job.get("pinned_agent"),
-                )
-            )
-
-        if leased:
-            return LeaseResponse(lease_id=str(uuid.uuid4()), tasks=leased)
-
-        # No work yet
         if time.time() >= deadline:
-            # Proper 204 with empty body
-            response.status_code = 204
-            # We must return nothing; easiest is raising HTTPException with 204.
-            raise HTTPException(status_code=204, detail="No work available")
+            return Response(status_code=204)
 
-        # Sleep briefly to avoid busy-spinning the controller
         time.sleep(0.1)
-
