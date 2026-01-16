@@ -843,7 +843,7 @@ async def register_agent(request: Request) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="Missing 'agent' or 'name'")
 
     labels = payload.get("labels") or {}
-    capabilities = payload.get("capabilities") or {}
+    capabilities = normalize_capabilities(payload.get("capabilities")) or {}
 
     raw_worker_profile = payload.get("worker_profile")
     if raw_worker_profile is None:
@@ -888,7 +888,7 @@ async def agent_heartbeat(request: Request) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="Missing 'agent' or 'name'")
 
     labels = payload.get("labels") or {}
-    capabilities = payload.get("capabilities") or {}
+    capabilities = normalize_capabilities(payload.get("capabilities")) or {}
 
     raw_worker_profile = payload.get("worker_profile")
     if raw_worker_profile is None:
