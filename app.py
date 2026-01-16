@@ -247,29 +247,36 @@ def _in_warmup(info: Dict[str, Any], now: float) -> bool:
         return False
 
 
-def _get_health_window(entry: Dict[str, Any]) -> Deque[int]:
+def _get_health_window(entry: Dict[str, Any]) -> List[int]:
     w = entry.get(HEALTH_WINDOW_KEY)
-    if isinstance(w, deque):
+    if isinstance(w, list):
         return w
-    try:
-        size = int((HEALTH_POLICY.get("window") or {}).get("size", 50) or 50)
-    except (TypeError, ValueError):
-        size = 50
-    w = deque(maxlen=max(1, size))
-    entry[HEALTH_WINDOW_KEY] = w
-    return w
+
+    entry[HEALTH_WINDOW_KEY] = []
+    return entry[HEALTH_WINDOW_KEY]
 
 
 def _record_outcome(entry: Dict[str, Any], failed: bool) -> None:
     w = _get_health_window(entry)
     w.append(1 if failed else 0)
+
+    try:
+        size = int((HEALTH_POLICY.get("window") or {}).get("size", 50) or 50)
+    except (TypeError, ValueError):
+        size = 50
+    size = max(1, size)
+
+    if len(w) > size:
+        del w[: len(w) - size]
+
     entry[HEALTH_WINDOW_KEY] = w
 
 
 def _recent_fail_rate(entry: Dict[str, Any]) -> Tuple[int, float]:
     w = entry.get(HEALTH_WINDOW_KEY)
-    if not isinstance(w, deque) or len(w) == 0:
+    if not isinstance(w, list) or len(w) == 0:
         return 0, 0.0
+
     n = len(w)
     fails = sum(1 for x in w if x == 1)
     return n, (fails / float(n)) if n > 0 else 0.0
