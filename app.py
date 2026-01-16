@@ -438,6 +438,35 @@ def _refresh_agent_states(now: Optional[float] = None) -> None:
 # -----------------------------------------------------------------------------
 # Capability helpers (op gating for leasing)  <-- FIX ADDED
 # -----------------------------------------------------------------------------
+def normalize_capabilities(raw: Any) -> Dict[str, Any]:
+    """
+    Canonical capabilities shape stored in AGENTS:
+      {"ops": [str, ...], ...}
+    """
+    if raw is None:
+        return {"ops": []}
+
+    if isinstance(raw, list):
+        return {"ops": [str(x) for x in raw if x is not None]}
+
+    if isinstance(raw, dict):
+        cap = dict(raw)
+        ops = cap.get("ops", [])
+
+        if ops is None:
+            ops = []
+        elif isinstance(ops, list):
+            ops = [str(x) for x in ops if x is not None]
+        elif isinstance(ops, dict):
+            ops = [str(k) for k, v in ops.items() if v is None or bool(v)]
+        else:
+            ops = [str(ops)]
+
+        cap["ops"] = ops
+        return cap
+
+    return {"ops": [str(raw)]}
+
 def _agent_ops(agent_info: Dict[str, Any]) -> set:
     """Normalize agent capabilities.ops into a set[str]."""
     caps = agent_info.get("capabilities") or {}
