@@ -165,13 +165,15 @@ async def post_result(req: ResultRequest) -> ResultResponse:
     if callable(result_fn):
         # Attempt 1: keyword args
         try:
-            result_fn(
+            r = result_fn(
                 job_id=req.job_id,
                 status=internal_status,
                 result=req.result,
                 error=req.error,
                 lease_id=req.lease_id,
             )
+            if inspect.iswaitable(r):
+                await r
         except TypeError:
             # Attempt 2: single payload dict (this matches your current controller signature)
             try:
@@ -182,11 +184,15 @@ async def post_result(req: ResultRequest) -> ResultResponse:
                     "result": req.result,
                     "error": req.error,
                 }
-                result_fn(payload)
+                r = result_fn(payload)
+                if inspect.isawaitable(r):
+                    await r
             except TypeError:
                 # Attempt 3: positional fallback (job_id, status, result, error)
                 try:
-                    result_fn(req.job_id, internal_status, req.result, req.error)
+                    r = result_fn(req.job_id, internal_status, req.result, req.error)
+                    if inspect.isawaitable(r):
+                        await r
                 except Exception as e:
                     raise HTTPException(status_code=500, detail=f"Failed to record result: {e}")
             except Exception as e:
