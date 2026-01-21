@@ -4,6 +4,7 @@ import inspect
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+from fastapi.encoders import jsonable_encoder
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
