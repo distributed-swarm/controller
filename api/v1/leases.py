@@ -110,11 +110,18 @@ def _upsert_agent_from_lease(req: LeaseRequest) -> None:
     except Exception:
         # If the agents module isn't available (or name differs), don't break leasing.
         return
+    # Normalize capabilities to list[str]
+    caps = req.capabilities
+    if isinstance(caps, dict):
+        caps = caps.get("ops") or []
+    if caps is None:
+        caps = []
+    caps = [str(x) for x in caps]
 
     upsert_agent(
         name=req.agent,
         labels={},
-        capabilities={"ops": list(req.capabilities or [])},
+        capabilities={"ops": caps},
         worker_profile=getattr(req, "worker_profile", None) or {},
         metrics=getattr(req, "metrics", None) or {},
     )
