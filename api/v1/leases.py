@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
@@ -14,9 +14,11 @@ router = APIRouter()
 
 class LeaseRequest(BaseModel):
     agent: str = Field(..., description="Agent name/id (e.g. 'cpu-1').")
-    capabilities: List[str] = Field(
-        default_factory=list,
-        description="Ops this agent can run (future-proofing).",
+    capabilities: Optional[Union[List[str], Dict[str, Any]]] = Field(
+    default=None,
+    description="Agent capabilities. Accepts legacy list[str] or v1 {'ops':[...]} dict.",
+)
+
     )
     max_tasks: int = Field(
         default=1,
