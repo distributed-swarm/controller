@@ -187,5 +187,11 @@ def list_agents() -> Dict[str, Any]:
     """
     Return known agents (UI worker list).
     """
-    _jobs, agents = _load_stores()
-    return {"agents": list(agents.values())}
+    jobs, agents = _load_stores()
+    out = []
+    for name, info in agents.items():
+        row = dict(info or {})
+        row["name"] = name
+        out.append(row)
+    return {"agents": out}
+
