@@ -177,15 +177,10 @@ async def post_result(req: ResultRequest) -> ResultResponse:
                 await r
         except TypeError:
             # Attempt 2: single payload dict (this matches your current controller signature)
+            # Attempt 2: pass the Pydantic object (legacy handler expects .json())
             try:
-                payload: Dict[str, Any] = {
-                    "lease_id": req.lease_id,
-                    "job_id": req.job_id,
-                    "status": internal_status,
-                    "result": req.result,
-                    "error": req.error,
-                }
-                r = result_fn(payload)
+                req.status = internal_status
+                r = result_fn(req)
                 if inspect.isawaitable(r):
                     await r
             except TypeError:
