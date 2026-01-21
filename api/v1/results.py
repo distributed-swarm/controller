@@ -157,7 +157,7 @@ async def post_result(req: ResultRequest) -> ResultResponse:
 
     # Try calling an existing controller result function if one exists.
     result_fn = None
-    for name in ("post_result", "_post_result", "handle_result", "_handle_result"):
+    for name in ("_post_result", "handle_result", "_handle_result"):
         fn = getattr(app, name, None)
         if callable(fn):
             result_fn = fn
