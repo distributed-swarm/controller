@@ -99,6 +99,25 @@ def _publish_job_leased_event(job: Dict[str, Any], lease_id: str, agent: str) ->
         # Never fail the lease call because SSE/event plumbing had a bad day.
         return
 
+def _upsert_agent_from_lease(req: LeaseRequest) -> None:
+    """
+    Minimal agent bookkeeping from /v1/leases.
+    This is what makes /v1/agents usable and enables pinned_agent routing later.
+    """
+    try:
+        # Prefer the canonical v1 agent store helper if present.
+        from api.v1.agents import upsert_agent  # type: ignore
+    except Exception:
+        # If the agents module isn't available (or name differs), don't break leasing.
+        return
+
+    upsert_agent(
+        name=req.agent,
+        labels={},
+        capabilities={"ops": list(req.capabilities or [])},
+        worker_profile=req.worker_profile or {},
+        metrics=req.metrics or {},
+    )
 
 @router.post("/leases", response_model=LeaseResponse, responses={204: {"description": "No work available"}})
 def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
