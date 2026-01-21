@@ -1,6 +1,6 @@
 # controller/api/v1/results.py
 from __future__ import annotations
-
+import inspect
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -117,7 +117,7 @@ def _infer_agent_from_job(job: Optional[Dict[str, Any]]) -> Optional[str]:
 
 
 @router.post("/results", response_model=ResultResponse)
-def post_result(req: ResultRequest) -> ResultResponse:
+async def post_result(req: ResultRequest) -> ResultResponse:
     """
     Report job completion.
 
