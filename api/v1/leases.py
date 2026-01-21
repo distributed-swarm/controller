@@ -115,8 +115,8 @@ def _upsert_agent_from_lease(req: LeaseRequest) -> None:
         name=req.agent,
         labels={},
         capabilities={"ops": list(req.capabilities or [])},
-        worker_profile=req.worker_profile or {},
-        metrics=req.metrics or {},
+        worker_profile=getattr(req, "worker_profile", None) or {},
+        metrics=getattr(req, "metrics", None) or {},
     )
 
 @router.post("/leases", response_model=LeaseResponse, responses={204: {"description": "No work available"}})
