@@ -11,14 +11,11 @@ from pydantic import BaseModel, Field
 
 router = APIRouter()
 
-
 class LeaseRequest(BaseModel):
     agent: str = Field(..., description="Agent name/id (e.g. 'cpu-1').")
     capabilities: Optional[Union[List[str], Dict[str, Any]]] = Field(
-    default=None,
-    description="Agent capabilities. Accepts legacy list[str] or v1 {'ops':[...]} dict.",
-)
-
+        default=None,
+        description="Agent capabilities. Accepts legacy list[str] or v1 {'ops':[...]} dict.",
     )
     max_tasks: int = Field(
         default=1,
@@ -26,6 +23,7 @@ class LeaseRequest(BaseModel):
         le=64,
         description="Max tasks to lease in one call.",
     )
+    
     timeout_ms: int = Field(
         default=25000,
         ge=0,
