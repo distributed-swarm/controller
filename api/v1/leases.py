@@ -129,6 +129,8 @@ def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
     - Tries to lease up to max_tasks jobs.
     - Returns 204 with empty body if no work is available by timeout.
     """
+    _upsert_agent_from_lease(req)
+
     # Defer import to avoid circular wiring issues while we build v1.
     try:
         from app import _lease_next_job  # type: ignore
