@@ -33,6 +33,7 @@ def upsert_agent(
         return
 
     entry = agents.get(name) or {}
+    entry.setdefault("tombstoned_at", None)
     entry.setdefault("labels", {})
     entry["labels"].update(labels)
 
