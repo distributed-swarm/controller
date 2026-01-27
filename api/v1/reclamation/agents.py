@@ -13,7 +13,9 @@ def upsert_agent(
 ) -> None:
     """
     Canonical v1 helper used by /v1/leases to keep the in-memory AGENTS store fresh.
-    Writes to app.AGENTS (shared with legacy paths) so there is one source of truth.
+
+    This intentionally writes to app.AGENTS (the same store legacy endpoints use),
+    so scheduling/gating has one source of truth.
     """
     import app  # type: ignore
 
@@ -38,6 +40,8 @@ def upsert_agent(
     entry["capabilities"].update(capabilities)
     entry["worker_profile"].update(worker_profile)
     entry["metrics"].update(metrics)
+
+    # liveness
     entry["last_seen"] = now
 
     agents[name] = entry
@@ -45,8 +49,8 @@ def upsert_agent(
 
 def tombstone_agent(name: str, tombstoned_at: float) -> bool:
     """
-    Mark an agent as tombstoned (idempotent).
-    Returns True if the agent exists (or is already tombstoned).
+    Apply-phase store op: mark an agent as tombstoned.
+    Idempotent: if already tombstoned, returns True.
     """
     import app  # type: ignore
 
@@ -67,8 +71,8 @@ def tombstone_agent(name: str, tombstoned_at: float) -> bool:
 
 def delete_agent(name: str) -> bool:
     """
-    Hard-delete an agent record.
-    Returns True if the agent existed.
+    Apply-phase store op: hard-delete an agent record.
+    Returns True if it existed.
     """
     import app  # type: ignore
 
