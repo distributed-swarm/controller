@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from fastapi import APIRouter, Query
 
-from api.v1.agents import tombstone_agent
+from api.v1.agents import tombstone_agent, delete_agent
 from domain.reclamation.candidates import AgentSnapshot, plan_agent_sweep
 from domain.reclamation.policy import AgentReclamationPolicy
 
@@ -16,7 +16,7 @@ def sweep_agents(dry_run: bool = Query(True)) -> dict:
     Agent reclamation sweep.
 
     - dry_run=true  -> report only (no mutation)
-    - dry_run=false -> APPLY tombstoning (NO deletion yet)
+    - dry_run=false -> APPLY tombstoning + deletion
 
     Notes:
     - We snapshot app.AGENTS items to avoid RuntimeError if the dict changes during iteration.
@@ -33,6 +33,7 @@ def sweep_agents(dry_run: bool = Query(True)) -> dict:
             "now": now,
             "policy": policy.__dict__,
             "dry_run": dry_run,
+            "tombstone_candidates": [],
             "tombstoned": [],
             "identified_for_deletion": [],
             "actually_deleted": [],
@@ -58,31 +59,31 @@ def sweep_agents(dry_run: bool = Query(True)) -> dict:
     plan = plan_agent_sweep(now=now, agents=snapshots, policy=policy)
 
     applied_tombstones: list[str] = []
+    actually_deleted: list[str] = []
     errors: list[dict] = []
 
     if not dry_run:
+        # 1) APPLY tombstoning
         for a in plan.to_tombstone:
             try:
                 ok = tombstone_agent(a.name, tombstoned_at=now, reason="stale_heartbeat")
                 if ok:
                     applied_tombstones.append(a.name)
                 else:
-                    errors.append(
-                        {
-                            "op": "tombstone",
-                            "name": a.name,
-                            "error": "agent_not_found",
-                        }
-                    )
+                    errors.append({"op": "tombstone", "name": a.name, "error": "agent_not_found"})
             except Exception as e:
-                # Don't swallow; surface it. (Also consider logging in your central logger.)
-                errors.append(
-                    {
-                        "op": "tombstone",
-                        "name": a.name,
-                        "error": str(e),
-                    }
-                )
+                errors.append({"op": "tombstone", "name": a.name, "error": str(e)})
+
+        # 2) APPLY deletion (only for candidates the domain marked deletable)
+        for a in plan.to_delete:
+            try:
+                ok = delete_agent(a.name)
+                if ok:
+                    actually_deleted.append(a.name)
+                else:
+                    errors.append({"op": "delete", "name": a.name, "error": "agent_not_found"})
+            except Exception as e:
+                errors.append({"op": "delete", "name": a.name, "error": str(e)})
 
     return {
         "now": now,
@@ -90,10 +91,9 @@ def sweep_agents(dry_run: bool = Query(True)) -> dict:
         "dry_run": dry_run,
         # Always report the plan (who is a candidate), regardless of whether apply happened.
         "tombstone_candidates": [{"name": a.name, "last_seen": a.last_seen} for a in plan.to_tombstone],
-        # When dry_run=false, also show who we actually touched.
         "tombstoned": applied_tombstones,
-        # Deletion not implemented yet; we only identify candidates for deletion.
+        # Deletion plan vs actual deletion are separated for clarity.
         "identified_for_deletion": [{"name": a.name, "tombstoned_at": a.tombstoned_at} for a in plan.to_delete],
-        "actually_deleted": [],
+        "actually_deleted": actually_deleted,
         "errors": errors,
     }
