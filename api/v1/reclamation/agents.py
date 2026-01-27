@@ -3,8 +3,9 @@ from __future__ import annotations
 import time
 from fastapi import APIRouter, Query
 
-from domain.reclamation.policy import AgentReclamationPolicy
+from api.v1.agents import tombstone_agent
 from domain.reclamation.candidates import AgentSnapshot, plan_agent_sweep
+from domain.reclamation.policy import AgentReclamationPolicy
 
 router = APIRouter(prefix="/reclamation/agents", tags=["reclamation"])
 
@@ -12,10 +13,14 @@ router = APIRouter(prefix="/reclamation/agents", tags=["reclamation"])
 @router.post("/sweep")
 def sweep_agents(dry_run: bool = Query(True)) -> dict:
     """
-    Dry-run agent reclamation sweep.
+    Agent reclamation sweep.
 
-    Reads current app.AGENTS, computes who *would* be tombstoned/deleted, and returns the plan.
-    This file does NOT mutate state yet (mutation comes next step).
+    - dry_run=true  -> report only (no mutation)
+    - dry_run=false -> APPLY tombstoning (NO deletion yet)
+
+    Notes:
+    - We snapshot app.AGENTS items to avoid RuntimeError if the dict changes during iteration.
+    - We return separate fields for "identified_for_deletion" vs "actually_deleted" for clarity.
     """
     import app  # type: ignore
 
@@ -29,12 +34,17 @@ def sweep_agents(dry_run: bool = Query(True)) -> dict:
             "policy": policy.__dict__,
             "dry_run": dry_run,
             "tombstoned": [],
-            "deleted": [],
+            "identified_for_deletion": [],
+            "actually_deleted": [],
+            "errors": [],
             "error": "app.AGENTS not available",
         }
 
-    snapshots = []
-    for name, entry in agents_store.items():
+    # Snapshot to avoid "dictionary changed size during iteration"
+    safe_items = list(agents_store.items())
+
+    snapshots: list[AgentSnapshot] = []
+    for name, entry in safe_items:
         if not isinstance(entry, dict):
             continue
         snapshots.append(
@@ -47,10 +57,43 @@ def sweep_agents(dry_run: bool = Query(True)) -> dict:
 
     plan = plan_agent_sweep(now=now, agents=snapshots, policy=policy)
 
+    applied_tombstones: list[str] = []
+    errors: list[dict] = []
+
+    if not dry_run:
+        for a in plan.to_tombstone:
+            try:
+                ok = tombstone_agent(a.name, tombstoned_at=now, reason="stale_heartbeat")
+                if ok:
+                    applied_tombstones.append(a.name)
+                else:
+                    errors.append(
+                        {
+                            "op": "tombstone",
+                            "name": a.name,
+                            "error": "agent_not_found",
+                        }
+                    )
+            except Exception as e:
+                # Don't swallow; surface it. (Also consider logging in your central logger.)
+                errors.append(
+                    {
+                        "op": "tombstone",
+                        "name": a.name,
+                        "error": str(e),
+                    }
+                )
+
     return {
         "now": now,
         "policy": policy.__dict__,
         "dry_run": dry_run,
-        "tombstoned": [{"name": a.name, "last_seen": a.last_seen} for a in plan.to_tombstone],
-        "deleted": [{"name": a.name, "tombstoned_at": a.tombstoned_at} for a in plan.to_delete],
+        # Always report the plan (who is a candidate), regardless of whether apply happened.
+        "tombstone_candidates": [{"name": a.name, "last_seen": a.last_seen} for a in plan.to_tombstone],
+        # When dry_run=false, also show who we actually touched.
+        "tombstoned": applied_tombstones,
+        # Deletion not implemented yet; we only identify candidates for deletion.
+        "identified_for_deletion": [{"name": a.name, "tombstoned_at": a.tombstoned_at} for a in plan.to_delete],
+        "actually_deleted": [],
+        "errors": errors,
     }
