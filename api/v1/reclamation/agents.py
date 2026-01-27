@@ -1,83 +1,103 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict
+from typing import Any, Dict, List
+
+from fastapi import APIRouter, Query
+
+from api.v1.agents import delete_agent, tombstone_agent
+from api.v1.events import publish_event
+from domain.reclamation.candidates import AgentSnapshot, plan_agent_sweep
+from domain.reclamation.policy import AgentReclamationPolicy
+
+# IMPORTANT:
+# api/v1/__init__.py imports "router" from this module, so it MUST exist.
+router = APIRouter()
 
 
-def upsert_agent(
-    name: str,
-    labels: Dict[str, Any] | None = None,
-    capabilities: Dict[str, Any] | None = None,
-    worker_profile: Dict[str, Any] | None = None,
-    metrics: Dict[str, Any] | None = None,
-) -> None:
+@router.post("/reclamation/agents/sweep")
+def sweep_agents(dry_run: bool = Query(True)) -> Dict[str, Any]:
     """
-    Canonical v1 helper used by /v1/leases to keep the in-memory AGENTS store fresh.
+    Sweep agent registry:
+      - Identify stale agents -> tombstone
+      - Identify tombstoned long enough -> delete
+    Domain decides WHAT; this endpoint applies minimal mutations to app.AGENTS.
 
-    This intentionally writes to app.AGENTS (the same store legacy endpoints use),
-    so scheduling/gating has one source of truth.
+    dry_run=true: compute + report plan only (no mutations, no events)
+    dry_run=false: apply mutations + emit SSE audit events
     """
     import app  # type: ignore
 
     now = time.time()
-    labels = labels or {}
-    capabilities = capabilities or {}
-    worker_profile = worker_profile or {}
-    metrics = metrics or {}
+    policy = AgentReclamationPolicy()
 
-    agents = getattr(app, "AGENTS", None)
-    if agents is None or not isinstance(agents, dict):
-        return
+    agents_store = getattr(app, "AGENTS", None)
+    if agents_store is None or not isinstance(agents_store, dict):
+        return {
+            "now": now,
+            "policy": policy.__dict__,
+            "dry_run": dry_run,
+            "tombstone_candidates": [],
+            "tombstoned": [],
+            "identified_for_deletion": [],
+            "actually_deleted": [],
+            "errors": [{"op": "init", "error": "app.AGENTS not available"}],
+        }
 
-    entry = agents.get(name) or {}
-    entry.setdefault("labels", {})
-    entry.setdefault("capabilities", {})
-    entry.setdefault("worker_profile", {})
-    entry.setdefault("metrics", {})
-    entry.setdefault("tombstoned_at", None)
+    # Snapshot to avoid: RuntimeError: dictionary changed size during iteration
+    safe_items = list(agents_store.items())
 
-    entry["labels"].update(labels)
-    entry["capabilities"].update(capabilities)
-    entry["worker_profile"].update(worker_profile)
-    entry["metrics"].update(metrics)
+    snapshots: List[AgentSnapshot] = []
+    for name, entry in safe_items:
+        if not isinstance(entry, dict):
+            continue
+        snapshots.append(
+            AgentSnapshot(
+                name=name,
+                last_seen=entry.get("last_seen"),
+                tombstoned_at=entry.get("tombstoned_at"),
+            )
+        )
 
-    # liveness
-    entry["last_seen"] = now
+    plan = plan_agent_sweep(now=now, agents=snapshots, policy=policy)
 
-    agents[name] = entry
+    tombstoned: List[str] = []
+    deleted: List[str] = []
+    errors: List[Dict[str, Any]] = []
 
+    if not dry_run:
+        # APPLY: tombstone
+        for a in plan.to_tombstone:
+            try:
+                ok = tombstone_agent(a.name, tombstoned_at=now)
+                if ok:
+                    tombstoned.append(a.name)
+                    publish_event("agent.tombstoned", {"name": a.name, "tombstoned_at": now})
+                else:
+                    errors.append({"op": "tombstone", "name": a.name, "error": "agent_not_found"})
+            except Exception as e:
+                errors.append({"op": "tombstone", "name": a.name, "error": str(e)})
 
-def tombstone_agent(name: str, tombstoned_at: float) -> bool:
-    """
-    Apply-phase store op: mark an agent as tombstoned.
-    Idempotent: if already tombstoned, returns True.
-    """
-    import app  # type: ignore
+        # APPLY: delete
+        for a in plan.to_delete:
+            try:
+                ok = delete_agent(a.name)
+                if ok:
+                    deleted.append(a.name)
+                    publish_event("agent.deleted", {"name": a.name})
+                else:
+                    errors.append({"op": "delete", "name": a.name, "error": "agent_not_found"})
+            except Exception as e:
+                errors.append({"op": "delete", "name": a.name, "error": str(e)})
 
-    agents = getattr(app, "AGENTS", None)
-    if agents is None or not isinstance(agents, dict):
-        return False
-
-    entry = agents.get(name)
-    if not isinstance(entry, dict):
-        return False
-
-    if entry.get("tombstoned_at") is not None:
-        return True
-
-    entry["tombstoned_at"] = tombstoned_at
-    return True
-
-
-def delete_agent(name: str) -> bool:
-    """
-    Apply-phase store op: hard-delete an agent record.
-    Returns True if it existed.
-    """
-    import app  # type: ignore
-
-    agents = getattr(app, "AGENTS", None)
-    if agents is None or not isinstance(agents, dict):
-        return False
-
-    return agents.pop(name, None) is not None
+    # Always report plan (even if dry_run)
+    return {
+        "now": now,
+        "policy": policy.__dict__,
+        "dry_run": dry_run,
+        "tombstone_candidates": [{"name": a.name, "last_seen": a.last_seen} for a in plan.to_tombstone],
+        "tombstoned": tombstoned,
+        "identified_for_deletion": [{"name": a.name, "tombstoned_at": a.tombstoned_at} for a in plan.to_delete],
+        "actually_deleted": deleted,
+        "errors": errors,
+    }
