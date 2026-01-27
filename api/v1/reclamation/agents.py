@@ -1,3 +1,4 @@
+# controller/api/v1/reclamation/agents.py
 from __future__ import annotations
 
 import time
@@ -6,25 +7,17 @@ from typing import Any, Dict, List
 from fastapi import APIRouter, Query
 
 from api.v1.agents import delete_agent, tombstone_agent
-from api.v1.events import publish_event
-from domain.reclamation.candidates import AgentSnapshot, plan_agent_sweep
 from domain.reclamation.policy import AgentReclamationPolicy
+from domain.reclamation.state_machine import AgentSnapshot, plan_agent_sweep
 
-# IMPORTANT:
-# api/v1/__init__.py imports "router" from this module, so it MUST exist.
-router = APIRouter()
+router = APIRouter(prefix="/reclamation/agents")
 
 
-@router.post("/reclamation/agents/sweep")
-def sweep_agents(dry_run: bool = Query(True)) -> Dict[str, Any]:
+@router.post("/sweep")
+def sweep_agents(dry_run: bool = Query(True)) -> dict:
     """
-    Sweep agent registry:
-      - Identify stale agents -> tombstone
-      - Identify tombstoned long enough -> delete
-    Domain decides WHAT; this endpoint applies minimal mutations to app.AGENTS.
-
-    dry_run=true: compute + report plan only (no mutations, no events)
-    dry_run=false: apply mutations + emit SSE audit events
+    Sweep agents based on last_seen/tombstoned_at.
+    dry_run=True returns the plan without mutating state.
     """
     import app  # type: ignore
 
@@ -35,16 +28,16 @@ def sweep_agents(dry_run: bool = Query(True)) -> Dict[str, Any]:
     if agents_store is None or not isinstance(agents_store, dict):
         return {
             "now": now,
-            "policy": policy.__dict__,
             "dry_run": dry_run,
+            "error": "AGENTS store missing or invalid",
             "tombstone_candidates": [],
             "tombstoned": [],
             "identified_for_deletion": [],
             "actually_deleted": [],
-            "errors": [{"op": "init", "error": "app.AGENTS not available"}],
+            "errors": [{"op": "sweep", "error": "agents_store_unavailable"}],
         }
 
-    # Snapshot to avoid: RuntimeError: dictionary changed size during iteration
+    # Snapshot keys/values to avoid RuntimeError if store mutates while iterating.
     safe_items = list(agents_store.items())
 
     snapshots: List[AgentSnapshot] = []
@@ -61,43 +54,41 @@ def sweep_agents(dry_run: bool = Query(True)) -> Dict[str, Any]:
 
     plan = plan_agent_sweep(now=now, agents=snapshots, policy=policy)
 
-    tombstoned: List[str] = []
-    deleted: List[str] = []
+    applied_tombstones: List[Dict[str, Any]] = []
+    actually_deleted: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
 
     if not dry_run:
-        # APPLY: tombstone
+        # APPLY tombstones
         for a in plan.to_tombstone:
             try:
-                ok = tombstone_agent(a.name, tombstoned_at=now)
+                ok = tombstone_agent(a.name, tombstoned_at=now, reason="stale_heartbeat")
                 if ok:
-                    tombstoned.append(a.name)
-                    publish_event("agent.tombstoned", {"name": a.name, "tombstoned_at": now})
+                    applied_tombstones.append({"name": a.name, "last_seen": a.last_seen})
                 else:
                     errors.append({"op": "tombstone", "name": a.name, "error": "agent_not_found"})
             except Exception as e:
                 errors.append({"op": "tombstone", "name": a.name, "error": str(e)})
 
-        # APPLY: delete
+        # APPLY deletes (hard delete). If you want “identify only”, keep dry_run=True.
         for a in plan.to_delete:
             try:
-                ok = delete_agent(a.name)
+                ok = delete_agent(a.name, deleted_at=now)
                 if ok:
-                    deleted.append(a.name)
-                    publish_event("agent.deleted", {"name": a.name})
+                    actually_deleted.append({"name": a.name, "tombstoned_at": a.tombstoned_at})
                 else:
                     errors.append({"op": "delete", "name": a.name, "error": "agent_not_found"})
             except Exception as e:
                 errors.append({"op": "delete", "name": a.name, "error": str(e)})
 
-    # Always report plan (even if dry_run)
     return {
         "now": now,
-        "policy": policy.__dict__,
+        "policy": getattr(policy, "__dict__", {}),
         "dry_run": dry_run,
+        # Always report the plan (candidates) regardless of apply.
         "tombstone_candidates": [{"name": a.name, "last_seen": a.last_seen} for a in plan.to_tombstone],
-        "tombstoned": tombstoned,
+        "tombstoned": applied_tombstones if not dry_run else [{"name": a.name, "last_seen": a.last_seen} for a in plan.to_tombstone],
         "identified_for_deletion": [{"name": a.name, "tombstoned_at": a.tombstoned_at} for a in plan.to_delete],
-        "actually_deleted": deleted,
+        "actually_deleted": actually_deleted,
         "errors": errors,
     }
