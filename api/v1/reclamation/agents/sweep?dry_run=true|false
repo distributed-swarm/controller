@@ -1,6 +1,0 @@
-{
-  "now": "...",
-  "policy": {"stale_after_seconds":120, "delete_after_seconds":3600},
-  "tombstoned": [{"agent_id":"...", "name":"..."}],
-  "deleted": [{"agent_id":"...", "name":"..."}]
-}
