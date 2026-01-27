@@ -1,32 +1,65 @@
+# controller/domain/reclamation/state_machine.py
 from __future__ import annotations
+
 from dataclasses import dataclass
-from enum import Enum
-from typing import Optional
+from typing import Iterable, List, Optional
 
-class AgentGCState(str, Enum):
-    LIVE = "live"
-    STALE = "stale"
-    TOMBSTONED = "tombstoned"
-    DELETABLE = "deletable"
+from .policy import AgentReclamationPolicy
 
-def classify_agent_state(
+
+@dataclass(frozen=True)
+class AgentSnapshot:
+    """
+    Minimal immutable view of an agent needed for reclamation decisions.
+    """
+    name: str
+    last_seen: Optional[float] = None
+    tombstoned_at: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class AgentSweepPlan:
+    """
+    Output of the domain decision step.
+    The API layer applies these via store-ops (tombstone/delete).
+    """
+    to_tombstone: List[AgentSnapshot]
+    to_delete: List[AgentSnapshot]
+
+
+def plan_agent_sweep(
     *,
     now: float,
-    last_seen: Optional[float],
-    tombstoned_at: Optional[float],
-    stale_after_seconds: int,
-    delete_after_seconds: int,
-) -> AgentGCState:
-    if tombstoned_at is not None:
-        if now - tombstoned_at >= delete_after_seconds:
-            return AgentGCState.DELETABLE
-        return AgentGCState.TOMBSTONED
+    agents: Iterable[AgentSnapshot],
+    policy: AgentReclamationPolicy,
+) -> AgentSweepPlan:
+    """
+    Pure domain logic. No FastAPI. No storage writes.
 
-    if last_seen is None:
-        # Never seen -> treat as stale.
-        return AgentGCState.STALE
+    Rules:
+      - If tombstoned_at is None and agent is stale => tombstone candidate.
+      - If tombstoned_at is set and tombstoned long enough => delete candidate.
+    """
+    stale_after = float(getattr(policy, "stale_after_seconds", 120))
+    delete_after = float(getattr(policy, "delete_after_seconds", 3600))
 
-    if now - last_seen >= stale_after_seconds:
-        return AgentGCState.STALE
+    to_tombstone: List[AgentSnapshot] = []
+    to_delete: List[AgentSnapshot] = []
 
-    return AgentGCState.LIVE
+    for a in agents:
+        # Already tombstoned? Maybe delete.
+        if a.tombstoned_at is not None:
+            if (now - a.tombstoned_at) >= delete_after:
+                to_delete.append(a)
+            continue
+
+        # Not tombstoned: decide staleness.
+        if a.last_seen is None:
+            # No heartbeat recorded -> treat as stale immediately.
+            to_tombstone.append(a)
+            continue
+
+        if (now - a.last_seen) >= stale_after:
+            to_tombstone.append(a)
+
+    return AgentSweepPlan(to_tombstone=to_tombstone, to_delete=to_delete)
