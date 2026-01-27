@@ -15,7 +15,7 @@ def sweep_agents(dry_run: bool = Query(True)) -> dict:
     Dry-run agent reclamation sweep.
 
     Reads current app.AGENTS, computes who *would* be tombstoned/deleted, and returns the plan.
-    If dry_run is False, we will still NOT mutate in this step (mutation comes next step).
+    This file does NOT mutate state yet (mutation comes next step).
     """
     import app  # type: ignore
 
@@ -27,7 +27,7 @@ def sweep_agents(dry_run: bool = Query(True)) -> dict:
         return {
             "now": now,
             "policy": policy.__dict__,
-            "dry_run": True,
+            "dry_run": dry_run,
             "tombstoned": [],
             "deleted": [],
             "error": "app.AGENTS not available",
@@ -50,7 +50,7 @@ def sweep_agents(dry_run: bool = Query(True)) -> dict:
     return {
         "now": now,
         "policy": policy.__dict__,
-        "dry_run": True,  # always true in this step
+        "dry_run": dry_run,
         "tombstoned": [{"name": a.name, "last_seen": a.last_seen} for a in plan.to_tombstone],
         "deleted": [{"name": a.name, "tombstoned_at": a.tombstoned_at} for a in plan.to_delete],
     }
