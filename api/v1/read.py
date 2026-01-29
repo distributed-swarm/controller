@@ -194,4 +194,15 @@ def list_agents() -> Dict[str, Any]:
         row["name"] = name
         out.append(row)
     return {"agents": out}
+@router.delete("/agents/{agent_name}", response_model=Dict[str, Any])
+def delete_agent_v1(agent_name: str) -> Dict[str, Any]:
+    """
+    Hard-delete an agent from the in-memory AGENTS store.
+    Idempotent: returns ok even if the agent did not exist.
+    """
+    from api.v1.agents import delete_agent  # local import avoids import-time coupling
+
+    deleted = delete_agent(agent_name)
+    return {"ok": True, "deleted": bool(deleted), "name": agent_name}
+    
 
