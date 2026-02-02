@@ -1,10 +1,10 @@
 # controller/api/v1/results.py
 from __future__ import annotations
+
 import inspect
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
-from fastapi.encoders import jsonable_encoder
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -15,6 +15,7 @@ router = APIRouter()
 class ResultRequest(BaseModel):
     lease_id: str = Field(..., description="Lease identifier returned by POST /v1/leases.")
     job_id: str = Field(..., description="Job identifier.")
+    job_epoch: int = Field(..., description="Epoch fencing token returned with the lease.")
     status: str = Field(..., description="Either 'succeeded' or 'failed'.")
     result: Optional[Any] = Field(default=None, description="Result payload (any JSON).")
     error: Optional[Any] = Field(default=None, description="Error payload (any JSON) if failed.")
@@ -117,6 +118,36 @@ def _infer_agent_from_job(job: Optional[Dict[str, Any]]) -> Optional[str]:
     return None
 
 
+def _is_expired(job: Dict[str, Any], now_ts: float) -> bool:
+    exp = job.get("lease_expires_at")
+    if exp is None:
+        return False
+    try:
+        return now_ts > float(exp)
+    except (TypeError, ValueError):
+        return False
+
+
+def _stale(code: str, *, job_id: str, req: ResultRequest, job: Optional[Dict[str, Any]] = None) -> None:
+    """
+    Reject stale/zombie results. 409 is correct: result conflicts with current lease/epoch.
+    """
+    detail: Dict[str, Any] = {"error": code, "job_id": job_id}
+
+    # Provide alias requested: STALE_EPOCH primary, STALE_LEASE alias.
+    if code == "STALE_EPOCH":
+        detail["alias"] = "STALE_LEASE"
+
+    if job is not None:
+        detail["expected"] = {
+            "job_epoch": job.get("job_epoch"),
+            "lease_id": job.get("lease_id"),
+            "lease_expires_at": job.get("lease_expires_at"),
+        }
+    detail["got"] = {"job_epoch": req.job_epoch, "lease_id": req.lease_id}
+    raise HTTPException(status_code=409, detail=detail)
+
+
 @router.post("/results", response_model=ResultResponse)
 async def post_result(req: ResultRequest) -> ResultResponse:
     """
@@ -132,6 +163,11 @@ async def post_result(req: ResultRequest) -> ResultResponse:
       - If the job is already terminal, accept and return ok.
       - If the controller result function returns ok but doesn't transition state,
         we force the in-memory JOBS record into a terminal state (truthful v1 behavior).
+
+    Step 2.2 additions:
+      - Epoch fencing (STALE_EPOCH / STALE_LEASE alias)
+      - Lease ID check (STALE_LEASE)
+      - Lease TTL expiry check (STALE_LEASE)
     """
     status_norm = (req.status or "").strip().lower()
     if status_norm not in ("succeeded", "failed"):
@@ -146,14 +182,46 @@ async def post_result(req: ResultRequest) -> ResultResponse:
 
     jobs = getattr(app, "JOBS", None)
     job: Optional[Dict[str, Any]] = None
+    now_ts = time.time()
+
     if isinstance(jobs, dict):
         maybe = jobs.get(req.job_id)
         if isinstance(maybe, dict):
             job = maybe
+
             if _job_is_terminal(job):
-                # Emit event even on idempotent repeats? Usually no.
-                # We'll avoid double-firing completed events.
+                # Avoid double-firing completed events.
                 return ResultResponse(ok=True)
+
+            # -----------------------------
+            # Epoch + lease fencing checks
+            # -----------------------------
+            expected_epoch = job.get("job_epoch")
+            expected_lease = job.get("lease_id")
+
+            # Enforce epoch if controller is issuing it
+            if expected_epoch is not None:
+                try:
+                    exp_epoch_i = int(expected_epoch)
+                except (TypeError, ValueError):
+                    exp_epoch_i = None
+
+                if exp_epoch_i is not None:
+                    try:
+                        got_epoch_i = int(req.job_epoch)
+                    except (TypeError, ValueError):
+                        got_epoch_i = None
+
+                    if got_epoch_i is None or got_epoch_i != exp_epoch_i:
+                        _stale("STALE_EPOCH", job_id=req.job_id, req=req, job=job)
+
+            # Enforce lease_id if controller is issuing it
+            if expected_lease is not None and str(req.lease_id) != str(expected_lease):
+                _stale("STALE_LEASE", job_id=req.job_id, req=req, job=job)
+
+            # Enforce TTL expiry if available
+            if _is_expired(job, now_ts):
+                _stale("STALE_LEASE", job_id=req.job_id, req=req, job=job)
 
     # Try calling an existing controller result function if one exists.
     result_fn = None
@@ -176,7 +244,6 @@ async def post_result(req: ResultRequest) -> ResultResponse:
             if inspect.iswaitable(r):
                 await r
         except TypeError:
-            # Attempt 2: single payload dict (this matches your current controller signature)
             # Attempt 2: pass the Pydantic object (legacy handler expects .json())
             try:
                 req.status = internal_status
