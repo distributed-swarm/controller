@@ -62,6 +62,10 @@ def sweep_agents(dry_run: bool = Query(False)) -> dict:
         # APPLY tombstones
         for a in plan.to_tombstone:
             try:
+                cur = agents_store.get(a.name)
+                if isinstance(cur, dict) and cur.get("state") == "healthy":
+                    continue
+                    
                 ok = tombstone_agent(a.name, tombstoned_at=now, reason="stale_heartbeat")
                 if ok:
                     applied_tombstones.append({"name": a.name, "last_seen": a.last_seen})
