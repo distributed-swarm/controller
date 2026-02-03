@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 router = APIRouter()
 
+
 class LeaseRequest(BaseModel):
     agent: str = Field(..., description="Agent name/id (e.g. 'cpu-1').")
     capabilities: Optional[Union[List[str], Dict[str, Any]]] = Field(
@@ -23,17 +24,19 @@ class LeaseRequest(BaseModel):
         le=64,
         description="Max tasks to lease in one call.",
     )
-    
     timeout_ms: int = Field(
         default=25000,
         ge=0,
         le=120000,
         description="Long-poll timeout in milliseconds.",
     )
+    # Note: labels/metrics/worker_profile may be sent by newer agents.
+    # We accept them permissively via getattr() in _upsert_agent_from_lease.
 
 
 class LeaseTask(BaseModel):
     job_id: str
+    job_epoch: int = Field(..., description="Current job epoch; required for /v1/results.")
     op: str
     # Back-compat: payload may be any JSON value, not only dicts.
     payload: Any = Field(default_factory=dict)
@@ -45,6 +48,30 @@ class LeaseResponse(BaseModel):
     tasks: List[LeaseTask]
 
 
+def _extract_job_epoch(job: Dict[str, Any]) -> int:
+    """
+    Extract a job epoch from possible key variants. Controller should store it under 'job_epoch'.
+    Agents require it to post /v1/results.
+    """
+    epoch = (
+        job.get("job_epoch")
+        if "job_epoch" in job
+        else job.get("jobEpoch")
+        if "jobEpoch" in job
+        else job.get("epoch")
+        if "epoch" in job
+        else None
+    )
+    if epoch is None:
+        # If you prefer strictness (500), change this to raise.
+        # Defaulting to 1 is safe only if you never reuse job_ids and have no split-brain.
+        return 1
+    try:
+        return int(epoch)
+    except Exception:
+        raise HTTPException(status_code=500, detail=f"Invalid job_epoch type/value: {epoch!r} for job={job!r}")
+
+
 def _normalize_job(job: Dict[str, Any]) -> LeaseTask:
     job_id = job.get("job_id") or job.get("id") or job.get("jobId")
     op = job.get("op") or job.get("type") or job.get("job_type") or job.get("jobType")
@@ -52,8 +79,11 @@ def _normalize_job(job: Dict[str, Any]) -> LeaseTask:
     if not job_id or not op:
         raise HTTPException(status_code=500, detail=f"Invalid leased job shape: {job}")
 
+    job_epoch = _extract_job_epoch(job)
+
     return LeaseTask(
         job_id=str(job_id),
+        job_epoch=job_epoch,
         op=str(op),
         payload=job.get("payload"),
         pinned_agent=job.get("pinned_agent") or job.get("pinnedAgent"),
@@ -83,12 +113,18 @@ def _publish_job_leased_event(job: Dict[str, Any], lease_id: str, agent: str) ->
     job_id = job.get("job_id") or job.get("id") or job.get("jobId")
     op = job.get("op") or job.get("type") or job.get("job_type") or job.get("jobType")
     pinned = job.get("pinned_agent") or job.get("pinnedAgent")
+    job_epoch = None
+    try:
+        job_epoch = _extract_job_epoch(job)
+    except Exception:
+        job_epoch = None
 
     try:
         publish_event(
             "job.leased",
             {
                 "job_id": str(job_id) if job_id is not None else None,
+                "job_epoch": job_epoch,
                 "lease_id": str(lease_id),
                 "agent": str(agent),
                 "op": str(op) if op is not None else None,
@@ -98,6 +134,7 @@ def _publish_job_leased_event(job: Dict[str, Any], lease_id: str, agent: str) ->
     except Exception:
         # Never fail the lease call because SSE/event plumbing had a bad day.
         return
+
 
 def _upsert_agent_from_lease(req: LeaseRequest) -> None:
     """
@@ -110,6 +147,7 @@ def _upsert_agent_from_lease(req: LeaseRequest) -> None:
     except Exception:
         # If the agents module isn't available (or name differs), don't break leasing.
         return
+
     # Normalize capabilities to list[str]
     caps = req.capabilities
     if isinstance(caps, dict):
@@ -125,6 +163,7 @@ def _upsert_agent_from_lease(req: LeaseRequest) -> None:
         worker_profile=getattr(req, "worker_profile", None) or {},
         metrics=getattr(req, "metrics", None) or {},
     )
+
 
 @router.post("/leases", response_model=LeaseResponse, responses={204: {"description": "No work available"}})
 def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
@@ -173,7 +212,7 @@ def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
                 # We refuse to return it to the wrong agent and keep polling.
                 break
 
-            # Normalize and append
+            # Normalize and append (now includes job_epoch)
             tasks.append(_normalize_job(job))
 
             # Emit SSE event (best-effort)
