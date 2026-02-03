@@ -14,7 +14,7 @@ router = APIRouter(prefix="/reclamation/agents")
 
 
 @router.post("/sweep")
-def sweep_agents(dry_run: bool = Query(True)) -> dict:
+def sweep_agents(dry_run: bool = Query(False)) -> dict:
     """
     Sweep agents based on last_seen/tombstoned_at.
     dry_run=True returns the plan without mutating state.
