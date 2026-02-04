@@ -11,7 +11,6 @@ from pydantic import BaseModel, Field
 
 router = APIRouter()
 
-
 # --- In-memory idempotency cache (good enough for now; DB later) ---
 # Maps idempotency_key -> job_id
 _IDEMPOTENCY: Dict[str, str] = {}
@@ -41,7 +40,7 @@ class JobSubmitRequest(BaseModel):
         description="If set, only this agent may lease the job.",
     )
 
-    # NEW: lease TTL override (seconds)
+    # NEW: per-job lease TTL override (seconds)
     lease_timeout_s: Optional[int] = Field(
         default=None,
         ge=1,
@@ -66,7 +65,7 @@ def _now_iso() -> str:
 
 def _publish_job_created_event(job_id: str, req: JobSubmitRequest, payload: Any) -> None:
     """
-    Best-effort: emit job.created to SSE. Must never break job submission.
+    Best-effort: emit job.created via SSE. Must never break job submission.
     """
     try:
         from api.v1.events import publish_event  # deferred to avoid circular imports
@@ -100,16 +99,12 @@ def _publish_job_created_event(job_id: str, req: JobSubmitRequest, payload: Any)
         return
 
 
-def _best_effort_set_job_lease_timeout(job_id: str, lease_timeout_s: Optional[int]) -> None:
+def _best_effort_set_job_field(job_id: str, key: str, value: Any) -> None:
     """
     Controller compatibility shim:
-    - If controller internals expose JOBS and STATE_LOCK, write lease_timeout_s directly.
-    - This lets the lease reaper / expiry logic use the new TTL even if _enqueue_job
-      doesn't accept lease_timeout_s as an argument.
+    - If controller internals expose JOBS and STATE_LOCK, patch the stored job dict.
     Never raises.
     """
-    if lease_timeout_s is None:
-        return
     try:
         import app  # type: ignore
     except Exception:
@@ -124,7 +119,7 @@ def _best_effort_set_job_lease_timeout(job_id: str, lease_timeout_s: Optional[in
         with lock:
             j = jobs.get(job_id)
             if isinstance(j, dict):
-                j["lease_timeout_s"] = int(lease_timeout_s)
+                j[key] = value
     except Exception:
         return
 
@@ -137,6 +132,7 @@ def submit_job(req: JobSubmitRequest) -> JobSubmitResponse:
     Logic:
     - If idempotency_key is provided and we've seen it, return the same job_id.
     - Otherwise generate a job_id and enqueue the job via the controller's existing enqueue function.
+    - Persist lease_timeout_s on the stored job dict (even if enqueue signature doesn't accept it).
     - Emit SSE event: job.created (best-effort).
     """
     # Idempotency: same key => same job_id
@@ -150,13 +146,10 @@ def submit_job(req: JobSubmitRequest) -> JobSubmitResponse:
 
     # Defer importing controller internals to avoid circular imports until we wire everything.
     try:
-        # Expectation: controller exposes _enqueue_job(op, payload, job_id=None, pinned_agent=None, excitatory_level=1, ...)
+        # app.py defines: _enqueue_job(op, payload, job_id=None, pinned_agent=None, excitatory_level=1) -> job_id
         from app import _enqueue_job  # type: ignore
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Runtime enqueue function not available: {e}",
-        )
+        raise HTTPException(status_code=500, detail=f"Runtime enqueue function not available: {e}")
 
     # Back-compat payload handling:
     # - Accept dict/list/string/number/etc.
@@ -173,7 +166,7 @@ def submit_job(req: JobSubmitRequest) -> JobSubmitResponse:
         else:
             payload = {"value": payload, "_constraints": req.constraints}
 
-    # Enqueue job (try the "nice" keyword path first)
+    # Enqueue job (try keyword path first; fall back to positional signature)
     try:
         _enqueue_job(
             op=req.op,
@@ -181,17 +174,24 @@ def submit_job(req: JobSubmitRequest) -> JobSubmitResponse:
             job_id=job_id,
             pinned_agent=req.pinned_agent,
             excitatory_level=req.priority if req.priority is not None else 1,
-            lease_timeout_s=req.lease_timeout_s,
+            lease_timeout_s=req.lease_timeout_s,  # may not exist in signature; handled below
         )
-    except TypeError as e:
-        # Controller signature may not accept lease_timeout_s yet.
-        # Fall back to the known-safe signature and patch JOBS directly.
-        print(f"WARNING: _enqueue_job signature mismatch: {e}")
+    except TypeError:
+        # Controller signature doesn't accept lease_timeout_s (current app.py).
         try:
-            _enqueue_job(req.op, payload, job_id, req.pinned_agent, req.priority if req.priority is not None else 1)
+            _enqueue_job(
+                req.op,
+                payload,
+                job_id,
+                req.pinned_agent,
+                req.priority if req.priority is not None else 1,
+            )
         except Exception as e2:
             raise HTTPException(status_code=500, detail=f"Failed to enqueue job: {e2}")
-        _best_effort_set_job_lease_timeout(job_id, req.lease_timeout_s)
+
+        # Ensure TTL is written into stored job dict so reaper/leases use it
+        if req.lease_timeout_s is not None:
+            _best_effort_set_job_field(job_id, "lease_timeout_s", int(req.lease_timeout_s))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to enqueue job: {e}")
 
