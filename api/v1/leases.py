@@ -48,6 +48,29 @@ class LeaseResponse(BaseModel):
     tasks: List[LeaseTask]
 
 
+# -----------------------------
+# Time / TTL helpers
+# -----------------------------
+
+def _now_ts() -> float:
+    return time.time()
+
+
+def _lease_ttl_seconds(req: LeaseRequest) -> int:
+    """
+    One TTL rule. Keep it bounded so an agent can't request nonsense.
+    Uses timeout_ms as a hint so leases outlive long-poll by a bit.
+    """
+    # e.g. timeout 25s -> ttl ~30s
+    base = int((req.timeout_ms or 0) / 1000)
+    ttl = base + 5
+    return max(5, min(ttl, 120))
+
+
+# -----------------------------
+# Job normalization / safety
+# -----------------------------
+
 def _extract_job_epoch(job: Dict[str, Any]) -> int:
     """
     Extract a job epoch from possible key variants. Controller should store it under 'job_epoch'.
@@ -63,8 +86,7 @@ def _extract_job_epoch(job: Dict[str, Any]) -> int:
         else None
     )
     if epoch is None:
-        # If you prefer strictness (500), change this to raise.
-        # Defaulting to 1 is safe only if you never reuse job_ids and have no split-brain.
+        # Defaulting to 1 is safe only if job_ids are not reused.
         return 1
     try:
         return int(epoch)
@@ -81,11 +103,15 @@ def _normalize_job(job: Dict[str, Any]) -> LeaseTask:
 
     job_epoch = _extract_job_epoch(job)
 
+    payload = job.get("payload")
+    if payload is None:
+        payload = {}
+
     return LeaseTask(
         job_id=str(job_id),
         job_epoch=job_epoch,
         op=str(op),
-        payload=job.get("payload"),
+        payload=payload,
         pinned_agent=job.get("pinned_agent") or job.get("pinnedAgent"),
     )
 
@@ -93,13 +119,16 @@ def _normalize_job(job: Dict[str, Any]) -> LeaseTask:
 def _job_allows_agent(job: Dict[str, Any], agent_name: str) -> bool:
     """
     Ensure pinned jobs never get returned to the wrong agent.
-    (This is a safety net in case the underlying leasing function is permissive.)
     """
     pinned = job.get("pinned_agent") or job.get("pinnedAgent")
     if pinned and str(pinned) != str(agent_name):
         return False
     return True
 
+
+# -----------------------------
+# SSE event publishing (best-effort)
+# -----------------------------
 
 def _publish_job_leased_event(job: Dict[str, Any], lease_id: str, agent: str) -> None:
     """
@@ -113,7 +142,7 @@ def _publish_job_leased_event(job: Dict[str, Any], lease_id: str, agent: str) ->
     job_id = job.get("job_id") or job.get("id") or job.get("jobId")
     op = job.get("op") or job.get("type") or job.get("job_type") or job.get("jobType")
     pinned = job.get("pinned_agent") or job.get("pinnedAgent")
-    job_epoch = None
+
     try:
         job_epoch = _extract_job_epoch(job)
     except Exception:
@@ -132,23 +161,23 @@ def _publish_job_leased_event(job: Dict[str, Any], lease_id: str, agent: str) ->
             },
         )
     except Exception:
-        # Never fail the lease call because SSE/event plumbing had a bad day.
         return
 
+
+# -----------------------------
+# Agent bookkeeping (best-effort)
+# -----------------------------
 
 def _upsert_agent_from_lease(req: LeaseRequest) -> None:
     """
     Minimal agent bookkeeping from /v1/leases.
-    This is what makes /v1/agents usable and enables pinned_agent routing later.
+    This makes /v1/agents usable and enables routing later.
     """
     try:
-        # Prefer the canonical v1 agent store helper if present.
         from api.v1.agents import upsert_agent  # type: ignore
     except Exception:
-        # If the agents module isn't available (or name differs), don't break leasing.
         return
 
-    # Normalize capabilities to list[str]
     caps = req.capabilities
     if isinstance(caps, dict):
         caps = caps.get("ops") or []
@@ -165,73 +194,16 @@ def _upsert_agent_from_lease(req: LeaseRequest) -> None:
     )
 
 
-@router.post("/leases", response_model=LeaseResponse, responses={204: {"description": "No work available"}})
-def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
+# -----------------------------
+# Epoch fencing support (the missing pieces)
+# -----------------------------
+
+def _set_authoritative_lease_fields(
+    job: Dict[str, Any],
+    *,
+    lease_id: str,
+    now: float,
+    ttl_s: int,
+) -> None:
     """
-    Lease work for an agent.
-
-    Behavior:
-    - Long-polls up to timeout_ms.
-    - Tries to lease up to max_tasks jobs.
-    - Returns 204 with empty body if no work is available by timeout.
-    """
-    _upsert_agent_from_lease(req)
-
-    # Defer import to avoid circular wiring issues while we build v1.
-    try:
-        from app import _lease_next_job  # type: ignore
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Controller lease function not available: {e}")
-
-    deadline = time.time() + (req.timeout_ms / 1000.0 if req.timeout_ms else 0.0)
-    tasks: List[LeaseTask] = []
-    lease_id = str(uuid.uuid4())
-
-    def try_lease_once() -> Optional[Dict[str, Any]]:
-        try:
-            # Note: capabilities currently unused here; underlying scheduler may evolve.
-            return _lease_next_job(req.agent)
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Leasing failed: {e}")
-
-    def drain_available_work_once() -> None:
-        """
-        Attempt to lease up to max_tasks immediately (no sleeping inside).
-        Applies pinned-agent safety check.
-        """
-        while len(tasks) < req.max_tasks:
-            job = try_lease_once()
-            if not job:
-                break
-
-            # Safety: never hand a pinned job to the wrong agent.
-            if not _job_allows_agent(job, req.agent):
-                # If underlying leasing already marked it leased, that's a bug upstream.
-                # We refuse to return it to the wrong agent and keep polling.
-                break
-
-            # Normalize and append (now includes job_epoch)
-            tasks.append(_normalize_job(job))
-
-            # Emit SSE event (best-effort)
-            _publish_job_leased_event(job, lease_id=lease_id, agent=req.agent)
-
-    # Fast path: timeout_ms == 0 => one attempt and return immediately.
-    if req.timeout_ms == 0:
-        drain_available_work_once()
-        if not tasks:
-            return Response(status_code=204)
-        return LeaseResponse(lease_id=lease_id, tasks=tasks)
-
-    # Long-poll loop
-    while True:
-        drain_available_work_once()
-        if tasks:
-            return LeaseResponse(lease_id=lease_id, tasks=tasks)
-
-        if time.time() >= deadline:
-            return Response(status_code=204)
-
-        time.sleep(0.1)
+    Authoritatively stamp the job with epoch + lease ownership.
