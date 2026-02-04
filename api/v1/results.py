@@ -190,8 +190,25 @@ async def post_result(req: ResultRequest) -> ResultResponse:
             job = maybe
 
             if _job_is_terminal(job):
-                # Avoid double-firing completed events.
-                return ResultResponse(ok=True)
+    # Idempotent retry is allowed ONLY if it matches the stored fencing tokens
+    expected_epoch = job.get("job_epoch")
+    expected_lease = job.get("lease_id")
+
+    if expected_epoch is not None:
+        try:
+            exp_epoch_i = int(expected_epoch)
+            got_epoch_i = int(req.job_epoch)
+        except (TypeError, ValueError):
+            _stale("STALE_EPOCH", job_id=req.job_id, req=req, job=job)
+        if got_epoch_i != exp_epoch_i:
+            _stale("STALE_EPOCH", job_id=req.job_id, req=req, job=job)
+
+    if expected_lease is not None and str(req.lease_id) != str(expected_lease):
+        _stale("STALE_LEASE", job_id=req.job_id, req=req, job=job)
+
+    # If it matches, accept idempotently.
+    return ResultResponse(ok=True)
+
 
             # -----------------------------
             # Epoch + lease fencing checks
