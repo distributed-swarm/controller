@@ -207,3 +207,155 @@ def _set_authoritative_lease_fields(
 ) -> None:
     """
     Authoritatively stamp the job with epoch + lease ownership.
+    This is required for /v1/results fencing to be truthful.
+    """
+    # If missing, start at epoch 1
+    job["job_epoch"] = int(job.get("job_epoch") or 1)
+    job["lease_id"] = lease_id
+    job["lease_expires_at"] = now + float(ttl_s)
+
+    # If your controller uses status fields, keep them consistent.
+    if job.get("status") in (None, "queued", "ready"):
+        job["status"] = "leased"
+
+
+def _expire_leases_best_effort(now: float) -> None:
+    """
+    Minimal controller-only "clock tick":
+    - If a job is leased and expired, bump epoch and clear lease fields.
+    - Mark the job available again (best-effort).
+    """
+    try:
+        import app  # type: ignore
+    except Exception:
+        return
+
+    jobs_store = getattr(app, "JOBS", None)
+    if not isinstance(jobs_store, dict):
+        # No visible job store to sweep; can't do anything here.
+        return
+
+    # Optional hooks if your scheduler/queue needs explicit requeueing.
+    requeue_fn = getattr(app, "_requeue_job", None)
+    mark_available_fn = getattr(app, "_mark_job_available", None)
+
+    for job_id, job in list(jobs_store.items()):
+        if not isinstance(job, dict):
+            continue
+        lease_id = job.get("lease_id")
+        exp = job.get("lease_expires_at")
+        if not lease_id or exp is None:
+            continue
+
+        try:
+            exp_f = float(exp)
+        except Exception:
+            # If exp is garbage, force-expire it rather than getting stuck.
+            exp_f = -1.0
+
+        if now > exp_f:
+            job["job_epoch"] = int(job.get("job_epoch") or 1) + 1
+            job["lease_id"] = None
+            job["lease_expires_at"] = None
+
+            # Mark available again in whatever way your system expects.
+            if job.get("status") == "leased":
+                job["status"] = "queued"
+
+            # If your scheduler requires requeue, try it (best-effort).
+            try:
+                if callable(mark_available_fn):
+                    mark_available_fn(job_id)
+                elif callable(requeue_fn):
+                    requeue_fn(job_id)
+            except Exception:
+                # Never break leasing because requeue helper had a bad day.
+                pass
+
+
+# -----------------------------
+# Endpoint
+# -----------------------------
+
+@router.post("/leases", response_model=LeaseResponse, responses={204: {"description": "No work available"}})
+def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
+    """
+    Lease work for an agent.
+
+    Behavior:
+    - Long-polls up to timeout_ms.
+    - Tries to lease up to max_tasks jobs.
+    - Returns 204 with empty body if no work is available by timeout.
+
+    Epoch fencing:
+    - On lease, controller stamps job_epoch (default 1), lease_id, lease_expires_at.
+    - Before leasing, controller expires old leases: bumps epoch and clears lease fields.
+    """
+    _upsert_agent_from_lease(req)
+
+    # Defer import to avoid circular wiring issues while we build v1.
+    try:
+        from app import _lease_next_job  # type: ignore
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Controller lease function not available: {e}")
+
+    now = _now_ts()
+    _expire_leases_best_effort(now)
+
+    lease_id = str(uuid.uuid4())
+    ttl_s = _lease_ttl_seconds(req)
+
+    deadline = now + (req.timeout_ms / 1000.0 if req.timeout_ms else 0.0)
+    tasks: List[LeaseTask] = []
+
+    def try_lease_once() -> Optional[Dict[str, Any]]:
+        try:
+            return _lease_next_job(req.agent)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Leasing failed: {e}")
+
+    def drain_available_work_once() -> None:
+        """
+        Attempt to lease up to max_tasks immediately (no sleeping inside).
+        Applies pinned-agent safety check.
+        """
+        while len(tasks) < req.max_tasks:
+            # "Clock tick" before each attempt, so long-polling advances epochs over time.
+            _expire_leases_best_effort(_now_ts())
+
+            job = try_lease_once()
+            if not job:
+                break
+
+            if not _job_allows_agent(job, req.agent):
+                # Safety: never hand a pinned job to the wrong agent.
+                break
+
+            # AUTHORITATIVE LEASE WRITE (the missing piece)
+            # NOTE: This assumes `job` is a reference to your stored job dict.
+            # If `_lease_next_job` returns a copy, you MUST persist these fields
+            # in your scheduler/store (e.g., via an app._commit_lease hook).
+            _set_authoritative_lease_fields(job, lease_id=lease_id, now=_now_ts(), ttl_s=ttl_s)
+
+            tasks.append(_normalize_job(job))
+            _publish_job_leased_event(job, lease_id=lease_id, agent=req.agent)
+
+    # Fast path: timeout_ms == 0 => one attempt and return immediately.
+    if req.timeout_ms == 0:
+        drain_available_work_once()
+        if not tasks:
+            return Response(status_code=204)
+        return LeaseResponse(lease_id=lease_id, tasks=tasks)
+
+    # Long-poll loop
+    while True:
+        drain_available_work_once()
+        if tasks:
+            return LeaseResponse(lease_id=lease_id, tasks=tasks)
+
+        if _now_ts() >= deadline:
+            return Response(status_code=204)
+
+        time.sleep(0.1)
