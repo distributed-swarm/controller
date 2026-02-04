@@ -41,6 +41,14 @@ class JobSubmitRequest(BaseModel):
         description="If set, only this agent may lease the job.",
     )
 
+    # NEW: lease TTL override (seconds)
+    lease_timeout_s: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=3600,
+        description="Optional per-job lease timeout in seconds (overrides controller default).",
+    )
+
     # Optional safety knob for flaky clients / retries
     idempotency_key: Optional[str] = Field(
         default=None,
@@ -83,10 +91,40 @@ def _publish_job_created_event(job_id: str, req: JobSubmitRequest, payload: Any)
                 "priority": req.priority if req.priority is not None else 1,
                 "constraints": req.constraints,
                 "pinned_agent": req.pinned_agent,
+                "lease_timeout_s": req.lease_timeout_s,
                 "payload_preview": payload_preview,
                 "created_at": _now_iso(),
             },
         )
+    except Exception:
+        return
+
+
+def _best_effort_set_job_lease_timeout(job_id: str, lease_timeout_s: Optional[int]) -> None:
+    """
+    Controller compatibility shim:
+    - If controller internals expose JOBS and STATE_LOCK, write lease_timeout_s directly.
+    - This lets the lease reaper / expiry logic use the new TTL even if _enqueue_job
+      doesn't accept lease_timeout_s as an argument.
+    Never raises.
+    """
+    if lease_timeout_s is None:
+        return
+    try:
+        import app  # type: ignore
+    except Exception:
+        return
+
+    jobs = getattr(app, "JOBS", None)
+    lock = getattr(app, "STATE_LOCK", None)
+    if not isinstance(jobs, dict) or lock is None:
+        return
+
+    try:
+        with lock:
+            j = jobs.get(job_id)
+            if isinstance(j, dict):
+                j["lease_timeout_s"] = int(lease_timeout_s)
     except Exception:
         return
 
@@ -112,7 +150,7 @@ def submit_job(req: JobSubmitRequest) -> JobSubmitResponse:
 
     # Defer importing controller internals to avoid circular imports until we wire everything.
     try:
-        # Expectation: controller exposes _enqueue_job(op, payload, job_id=None, pinned_agent=None, excitatory_level=1)
+        # Expectation: controller exposes _enqueue_job(op, payload, job_id=None, pinned_agent=None, excitatory_level=1, ...)
         from app import _enqueue_job  # type: ignore
     except Exception as e:
         raise HTTPException(
@@ -135,6 +173,7 @@ def submit_job(req: JobSubmitRequest) -> JobSubmitResponse:
         else:
             payload = {"value": payload, "_constraints": req.constraints}
 
+    # Enqueue job (try the "nice" keyword path first)
     try:
         _enqueue_job(
             op=req.op,
@@ -142,15 +181,17 @@ def submit_job(req: JobSubmitRequest) -> JobSubmitResponse:
             job_id=job_id,
             pinned_agent=req.pinned_agent,
             excitatory_level=req.priority if req.priority is not None else 1,
+            lease_timeout_s=req.lease_timeout_s,
         )
     except TypeError as e:
-        # If the controller signature differs, fall back to positional call with safest ordering.
-        # Log this so we don't silently hide real bugs during migration.
+        # Controller signature may not accept lease_timeout_s yet.
+        # Fall back to the known-safe signature and patch JOBS directly.
         print(f"WARNING: _enqueue_job signature mismatch: {e}")
         try:
             _enqueue_job(req.op, payload, job_id, req.pinned_agent, req.priority if req.priority is not None else 1)
         except Exception as e2:
             raise HTTPException(status_code=500, detail=f"Failed to enqueue job: {e2}")
+        _best_effort_set_job_lease_timeout(job_id, req.lease_timeout_s)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to enqueue job: {e}")
 
