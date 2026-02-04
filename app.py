@@ -567,6 +567,11 @@ async def _lease_reaper_loop(interval_s: float = 1.0) -> None:
                             state, reason = _compute_agent_state(entry, now)
                             _set_agent_health(agent_name, entry, state, reason, now)
 
+                     # v1 fencing: bump epoch + clear v1 lease identity
+                    job["job_epoch"] = int(job.get("job_epoch") or 1) + 1
+                    job["lease_id"] = None
+                    job["lease_expires_at"] = None
+
                     job["status"] = "queued"
                     job["leased_ts"] = None
                     job["leased_by"] = None
@@ -576,7 +581,6 @@ async def _lease_reaper_loop(interval_s: float = 1.0) -> None:
                     TASK_QUEUES[lvl].append(job_id)
 
         await asyncio.sleep(interval_s)
-
 
 @app.on_event("startup")
 async def controller_startup() -> None:
