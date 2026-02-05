@@ -29,6 +29,21 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _try_publish_event(event: str, data: Dict[str, Any]) -> None:
+    """
+    Best-effort: emit event to SSE. Must never break result posting.
+    """
+    try:
+        from api.v1.events import publish_event  # deferred to avoid circular imports
+    except Exception:
+        return
+
+    try:
+        publish_event(event, data)
+    except Exception:
+        return
+
+
 def _publish_job_completed_event(
     *,
     job_id: str,
@@ -37,26 +52,88 @@ def _publish_job_completed_event(
     agent: Optional[str],
     error: Optional[Any],
 ) -> None:
-    """Best-effort: emit job.completed to SSE. Must never break result posting."""
-    try:
-        from api.v1.events import publish_event  # deferred to avoid circular imports
-    except Exception:
-        return
+    _try_publish_event(
+        "job.completed",
+        {
+            "job_id": job_id,
+            "lease_id": lease_id,
+            "agent": agent,
+            "status": status_norm,  # external vocab: succeeded/failed
+            "error": error,
+            "completed_at": _now_iso(),
+        },
+    )
 
-    try:
-        publish_event(
-            "job.completed",
-            {
-                "job_id": job_id,
-                "lease_id": lease_id,
-                "agent": agent,
-                "status": status_norm,  # external vocab: succeeded/failed
-                "error": error,
-                "completed_at": _now_iso(),
-            },
-        )
-    except Exception:
-        return
+
+def _publish_job_result_rejected_event(
+    *,
+    job_id: str,
+    req: ResultRequest,
+    job: Optional[Dict[str, Any]],
+    reason: str,
+) -> None:
+    expected: Dict[str, Any] = {}
+    if isinstance(job, dict):
+        expected = {
+            "job_epoch": job.get("job_epoch"),
+            "lease_id": job.get("lease_id"),
+            "lease_expires_at": job.get("lease_expires_at"),
+        }
+
+    _try_publish_event(
+        "job.result.rejected",
+        {
+            "job_id": job_id,
+            "lease_id": req.lease_id,
+            "job_epoch_got": req.job_epoch,
+            "job_epoch_expected": expected.get("job_epoch") if expected else None,
+            "lease_id_expected": expected.get("lease_id") if expected else None,
+            "lease_expires_at": expected.get("lease_expires_at") if expected else None,
+            "reason": reason,  # STALE_EPOCH / STALE_LEASE
+            "alias": "STALE_LEASE" if reason == "STALE_EPOCH" else None,
+            "rejected_at": _now_iso(),
+        },
+    )
+
+
+def _publish_job_result_duplicate_event(
+    *,
+    job_id: str,
+    req: ResultRequest,
+    job: Optional[Dict[str, Any]],
+    status_norm: str,
+) -> None:
+    _try_publish_event(
+        "job.result.duplicate",
+        {
+            "job_id": job_id,
+            "lease_id": req.lease_id,
+            "job_epoch": req.job_epoch,
+            "status": status_norm,
+            "agent": _infer_agent_from_job(job),
+            "duplicate_at": _now_iso(),
+        },
+    )
+
+
+def _publish_job_result_accepted_event(
+    *,
+    job_id: str,
+    req: ResultRequest,
+    job: Optional[Dict[str, Any]],
+    status_norm: str,
+) -> None:
+    _try_publish_event(
+        "job.result.accepted",
+        {
+            "job_id": job_id,
+            "lease_id": req.lease_id,
+            "job_epoch": req.job_epoch,
+            "status": status_norm,
+            "agent": _infer_agent_from_job(job),
+            "accepted_at": _now_iso(),
+        },
+    )
 
 
 def _force_transition_job(job: Dict[str, Any], *, internal_status: str, req: ResultRequest) -> None:
@@ -117,7 +194,13 @@ def _is_expired(job: Dict[str, Any], now_ts: float) -> bool:
 
 
 def _stale(code: str, *, job_id: str, req: ResultRequest, job: Optional[Dict[str, Any]] = None) -> None:
-    """Reject stale/zombie results. 409 is correct: result conflicts with current lease/epoch."""
+    """
+    Reject stale/zombie results. 409 is correct: result conflicts with current lease/epoch.
+
+    Ruthless addition: always emit job.result.rejected (best-effort) before raising.
+    """
+    _publish_job_result_rejected_event(job_id=job_id, req=req, job=job, reason=code)
+
     detail: Dict[str, Any] = {"error": code, "job_id": job_id}
 
     # Provide alias requested: STALE_EPOCH primary, STALE_LEASE alias.
@@ -173,6 +256,11 @@ async def post_result(req: ResultRequest) -> ResultResponse:
     This endpoint is intentionally idempotent:
       - If the job is already terminal, accept ONLY if fencing tokens match.
       - Otherwise enforce fencing, record result, and ensure job transitions terminal.
+
+    Ruthless additions:
+      - terminal idempotent success emits job.result.duplicate
+      - non-terminal success emits job.result.accepted (+ existing job.completed)
+      - any stale rejection emits job.result.rejected (inside _stale)
     """
     status_norm = (req.status or "").strip().lower()
     if status_norm not in ("succeeded", "failed"):
@@ -198,6 +286,7 @@ async def post_result(req: ResultRequest) -> ResultResponse:
             # IMPORTANT: even if terminal, only accept idempotently if tokens match.
             if _job_is_terminal(job):
                 _enforce_fencing(job, req, now_ts)
+                _publish_job_result_duplicate_event(job_id=req.job_id, req=req, job=job, status_norm=status_norm)
                 return ResultResponse(ok=True)
 
             # Non-terminal: enforce fencing before recording.
@@ -252,6 +341,8 @@ async def post_result(req: ResultRequest) -> ResultResponse:
             elif isinstance(maybe2, dict):
                 job = maybe2
 
+        # Non-terminal path success => accepted + completed
+        _publish_job_result_accepted_event(job_id=req.job_id, req=req, job=job, status_norm=status_norm)
         _publish_job_completed_event(
             job_id=req.job_id,
             lease_id=req.lease_id,
@@ -271,11 +362,13 @@ async def post_result(req: ResultRequest) -> ResultResponse:
 
     if _job_is_terminal(job2):
         _enforce_fencing(job2, req, now_ts)
+        _publish_job_result_duplicate_event(job_id=req.job_id, req=req, job=job2, status_norm=status_norm)
         return ResultResponse(ok=True)
 
     _enforce_fencing(job2, req, now_ts)
     _force_transition_job(job2, internal_status=internal_status, req=req)
 
+    _publish_job_result_accepted_event(job_id=req.job_id, req=req, job=job2, status_norm=status_norm)
     _publish_job_completed_event(
         job_id=req.job_id,
         lease_id=req.lease_id,
