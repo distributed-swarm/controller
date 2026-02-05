@@ -212,6 +212,7 @@ def _stamp_authoritative_lease(job: Dict[str, Any], *, lease_id: str, now: float
     job["job_epoch"] = epoch
     job["lease_id"] = lease_id
 
+    job["leased_ts"] = now
     # Prefer job-specific lease_timeout_s if present to avoid conflicting timers
     timeout_s = job.get("lease_timeout_s")
     if timeout_s is not None:
