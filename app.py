@@ -27,7 +27,7 @@ RECLAIM_INTERVAL_SEC = 30
 async def start_reclaimer():
     async def loop():
         while True:
-            sweep_agents()
+            sweep_agents(dry_run=False)
             await asyncio.sleep(RECLAIM_INTERVAL_SEC)
 
     asyncio.create_task(loop())
