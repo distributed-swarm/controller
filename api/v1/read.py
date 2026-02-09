@@ -192,6 +192,7 @@ def list_agents() -> Dict[str, Any]:
     for name, info in agents.items():
         row = dict(info or {})
         row["name"] = name
+        row["last_seen_at"] = info.get("last_seen")
         out.append(row)
     return {"agents": out}
 @router.delete("/agents/{agent_name}", response_model=Dict[str, Any])
