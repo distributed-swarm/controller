@@ -11,6 +11,7 @@ from starlette.responses import Response
 
 from api.v1.events import publish_event
 from api.v1 import router as v1_router
+from api.v1.reclamation.agents import sweep_agents
 
 from pipelines.engine import run_text_pipeline
 from pipelines.spec import IntakeRequest
@@ -19,6 +20,17 @@ from brainstem import Brainstem
 
 app = FastAPI(title="Distributed Swarm Controller")
 app.include_router(v1_router, prefix="/v1")
+
+RECLAIM_INTERVAL_SEC = 30
+
+@app.on_event("startup")
+async def start_reclaimer():
+    async def loop():
+        while True:
+            sweep_agents()
+            await asyncio.sleep(RECLAIM_INTERVAL_SEC)
+
+    asyncio.create_task(loop())
 
 # -----------------------------------------------------------------------------
 # Brainstem (stable scheduling policy)
