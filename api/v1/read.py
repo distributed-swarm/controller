@@ -1,16 +1,14 @@
-# controller/api/v1/read.py
+# api/v1/read.py
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 router = APIRouter()
 
-
-# ---------- helpers ----------
 
 def _require_namespace(namespace: Optional[str]) -> str:
     ns = (namespace or "").strip()
@@ -59,7 +57,7 @@ def _job_matches_filters(
             return False
 
     if since_dt:
-        ts = job.get("updated_at") or job.get("created_at") or job.get("submitted_at")
+        ts = job.get("updated_at") or job.get("created_at") or job.get("submitted_at") or job.get("created_ts")
         if not ts:
             return False
         try:
@@ -73,25 +71,11 @@ def _job_matches_filters(
 
 
 def _load_stores() -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """
-    Pull in-memory stores from the running app module.
-    IMPORTANT: This file may exist in repos where the runtime module is either
-    'app' (image build) or 'controller.app' (editable install).
-    We'll try both.
-    """
-    app_mod = None
-    err: Optional[Exception] = None
-
-    for modname in ("app", "controller.app"):
-        try:
-            app_mod = __import__(modname, fromlist=["*"])
-            break
-        except Exception as e:
-            err = e
-            continue
-
-    if app_mod is None:
-        raise HTTPException(status_code=500, detail=f"Runtime app module not available: {err}")
+    # In the GHCR image, the runtime is /app/app.py as module "app".
+    try:
+        import app as app_mod  # type: ignore
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Runtime app module not available: {e}")
 
     jobs = getattr(app_mod, "JOBS", None)
     agents = getattr(app_mod, "AGENTS", None)
@@ -107,15 +91,10 @@ def _load_stores() -> Tuple[Dict[str, Any], Dict[str, Any]]:
 def _normalize_job_for_v1(job: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(job)
     out["state"] = _to_v1_state(str(job.get("status", "")))
-    if out.get("status") == "completed":
-        out["status"] = "completed"
     return out
 
 
 def _agent_namespace(info: Dict[str, Any]) -> Optional[str]:
-    # Allow multiple shapes:
-    # - info["namespace"]
-    # - info["labels"]["namespace"]
     ns = info.get("namespace")
     if ns:
         return str(ns)
@@ -125,19 +104,12 @@ def _agent_namespace(info: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-# ---------- response models ----------
-
 class JobsListResponse(BaseModel):
     jobs: List[Dict[str, Any]]
 
 
-# ---------- endpoints ----------
-
 @router.get("/jobs/{job_id}", response_model=Dict[str, Any])
 def get_job(job_id: str, namespace: str = Query(..., description="Namespace (required)")) -> Dict[str, Any]:
-    """
-    Read one job. Namespace is required; mismatch returns 404 (no existence leak).
-    """
     ns = _require_namespace(namespace)
     jobs, _agents = _load_stores()
 
@@ -146,7 +118,6 @@ def get_job(job_id: str, namespace: str = Query(..., description="Namespace (req
         raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id}")
 
     if str(job.get("namespace") or "") != ns:
-        # Do not leak that the job exists in another namespace
         raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id}")
 
     out = _normalize_job_for_v1(job)
@@ -157,48 +128,35 @@ def get_job(job_id: str, namespace: str = Query(..., description="Namespace (req
 @router.get("/jobs", response_model=JobsListResponse)
 def list_jobs(
     namespace: str = Query(..., description="Namespace (required)"),
-    state: Optional[str] = Query(default=None, description="Filter by state (queued|leased|running|succeeded|failed)"),
-    agent: Optional[str] = Query(default=None, description="Filter by agent (leased_by or pinned_agent)"),
-    op: Optional[str] = Query(default=None, description="Filter by op"),
-    since: Optional[str] = Query(default=None, description="Filter by updated_at >= since (ISO-8601)"),
-    limit: int = Query(default=200, ge=1, le=5000, description="Max jobs returned"),
+    state: Optional[str] = Query(default=None),
+    agent: Optional[str] = Query(default=None),
+    op: Optional[str] = Query(default=None),
+    since: Optional[str] = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=5000),
 ) -> JobsListResponse:
-    """
-    Namespace-filtered job list.
-    """
     ns = _require_namespace(namespace)
     since_dt = _parse_since(since)
-
     jobs, _agents = _load_stores()
 
     items: List[Dict[str, Any]] = []
     for jid, job in jobs.items():
         if not isinstance(job, dict):
             continue
-
         if str(job.get("namespace") or "") != ns:
             continue
-
         if _job_matches_filters(job, state, agent, op, since_dt):
             out = _normalize_job_for_v1(job)
             out.setdefault("job_id", jid)
             items.append(out)
 
-    def sort_key(j: Dict[str, Any]) -> str:
-        return str(j.get("updated_at") or j.get("created_at") or "")
-
-    items.sort(key=sort_key, reverse=True)
+    items.sort(key=lambda j: str(j.get("updated_at") or j.get("created_at") or j.get("created_ts") or ""), reverse=True)
     if len(items) > limit:
         items = items[:limit]
-
     return JobsListResponse(jobs=items)
 
 
 @router.get("/agents", response_model=Dict[str, Any])
 def list_agents(namespace: str = Query(..., description="Namespace (required)")) -> Dict[str, Any]:
-    """
-    Namespace-filtered agent list.
-    """
     ns = _require_namespace(namespace)
     _jobs, agents = _load_stores()
 
@@ -206,19 +164,9 @@ def list_agents(namespace: str = Query(..., description="Namespace (required)"))
     for name, info in agents.items():
         row = dict(info or {})
         row["name"] = name
-        row["last_seen_at"] = (info or {}).get("last_seen")
-
         a_ns = _agent_namespace(row)
         if a_ns != ns:
             continue
-
         out.append(row)
 
     return {"agents": out}
-
-
-@router.delete("/agents/{agent_name}", response_model=Dict[str, Any])
-def delete_agent_v1(agent_name: str) -> Dict[str, Any]:
-    from api.v1.agents import delete_agent  # local import avoids import-time coupling
-    deleted = delete_agent(agent_name)
-    return {"ok": True, "deleted": bool(deleted), "name": agent_name}
