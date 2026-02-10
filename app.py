@@ -764,14 +764,16 @@ def _enqueue_job(
     job_id: Optional[str] = None,
     pinned_agent: Optional[str] = None,
     excitatory_level: int = 1,
+    namespace: str = "default",
 ) -> str:
     if job_id is None:
         job_id = str(uuid.uuid4())
 
     lvl = max(0, min(3, int(excitatory_level)))
-
+    ns = str(namespace or "default") 
     job = {
         "id": job_id,
+        "namespace": ns,
         "op": op,
         "payload": payload,
         "created_ts": _now(),
