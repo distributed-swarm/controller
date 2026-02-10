@@ -1,153 +1,110 @@
-# controller/api/v1/events.py
+# controller/api/v1/jobs.py
 from __future__ import annotations
 
-import asyncio
-import json
-import time
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
 
 router = APIRouter()
 
 
-@dataclass
-class _Subscriber:
-    q: asyncio.Queue
-    namespace: str
-    include_global: bool = False
+class JobConstraints(BaseModel):
+    pinned_agent: Optional[str] = Field(default=None, description="If set, only this agent may lease the job.")
 
 
-# --- In-process pub/sub for SSE subscribers (namespace-filtered) ---
-_SUBSCRIBERS: List[_Subscriber] = []
-_SUBSCRIBERS_LOCK = asyncio.Lock()
+class CreateJobRequest(BaseModel):
+    # HARD boundary: namespace is REQUIRED
+    namespace: str = Field(..., min_length=1, description="Tenant/namespace (required).")
 
-# Main event loop reference (used to publish from sync/threadpool contexts)
-_MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
+    op: str = Field(..., min_length=1, description="Operation name (e.g. 'echo').")
+    payload: Any = Field(..., description="Arbitrary JSON payload for the op.")
 
-# How often to send keepalive comments (seconds)
-_KEEPALIVE_INTERVAL_S = 15.0
+    # Optional caller-provided id (idempotency-ish)
+    job_id: Optional[str] = Field(default=None, description="Optional job id (client-supplied).")
+    id: Optional[str] = Field(default=None, description="Alias for job_id (client-supplied).")
 
+    # Priority (maps to excitatory_level 0..3)
+    priority: Optional[int] = Field(default=None, ge=0, le=3, description="0..3 (3 highest).")
+    excitatory_level: Optional[int] = Field(default=None, ge=0, le=3, description="Alias for priority (0..3).")
 
-def _sse_format(event_type: str, data: Dict[str, Any]) -> str:
-    payload = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
-    return f"event: {event_type}\ndata: {payload}\n\n"
-
-
-async def _add_subscriber(sub: _Subscriber) -> None:
-    async with _SUBSCRIBERS_LOCK:
-        _SUBSCRIBERS.append(sub)
+    constraints: Optional[JobConstraints] = Field(default=None)
 
 
-async def _remove_subscriber(sub: _Subscriber) -> None:
-    async with _SUBSCRIBERS_LOCK:
-        try:
-            _SUBSCRIBERS.remove(sub)
-        except ValueError:
-            pass
+class CreateJobResponse(BaseModel):
+    ok: bool = True
+    job_id: str
 
 
-async def _broadcast(event_type: str, data: Dict[str, Any]) -> None:
+@router.post("/jobs", response_model=CreateJobResponse)
+def create_job(req: CreateJobRequest) -> CreateJobResponse:
     """
-    Namespace-filtered fan-out.
+    v1 job submission.
 
-    Rule:
-      - If event has data["namespace"] == "<ns>", deliver only to subscribers of that ns.
-      - If event has no namespace or namespace is None => "global event"
-        deliver only to subscribers with include_global=True.
+    This is the missing syscall: create a job so it can be leased via POST /v1/leases.
     """
-    ev_ns = data.get("namespace")
-    msg = _sse_format(event_type, data)
-
-    async with _SUBSCRIBERS_LOCK:
-        subs = list(_SUBSCRIBERS)
-
-    for sub in subs:
-        if ev_ns is None:
-            if not sub.include_global:
-                continue
-        else:
-            if str(ev_ns) != sub.namespace:
-                continue
-        try:
-            sub.q.put_nowait(msg)
-        except asyncio.QueueFull:
-            pass
-
-
-def publish_event(event_type: str, data: Dict[str, Any]) -> None:
-    """
-    Best-effort publish; safe from async or sync contexts.
-    """
-    global _MAIN_LOOP
-
-    # Fast exit if nobody is listening.
-    try:
-        if not _SUBSCRIBERS:
-            return
-    except Exception:
-        return
-
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_broadcast(event_type, data))
-        return
-    except RuntimeError:
-        pass
-
-    if _MAIN_LOOP is None:
-        return
-
-    try:
-        _MAIN_LOOP.call_soon_threadsafe(asyncio.create_task, _broadcast(event_type, data))
-    except Exception:
-        return
-
-
-@router.get("/events")
-async def sse_events(request: Request, namespace: str, include_global: bool = False) -> StreamingResponse:
-    """
-    SSE stream (namespace-filtered).
-    Requires namespace to prevent cross-tenant leakage.
-    """
-    ns = (namespace or "").strip()
+    ns = (req.namespace or "").strip()
     if not ns:
         raise HTTPException(status_code=400, detail="namespace is required")
 
-    global _MAIN_LOOP
     try:
-        _MAIN_LOOP = asyncio.get_running_loop()
-    except Exception:
-        pass
+        import app as app_mod  # type: ignore
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Runtime module 'app' not available: {e}")
 
-    q: asyncio.Queue = asyncio.Queue(maxsize=200)
-    sub = _Subscriber(q=q, namespace=ns, include_global=bool(include_global))
-    await _add_subscriber(sub)
+    state_lock = getattr(app_mod, "STATE_LOCK", None)
+    enqueue = getattr(app_mod, "_enqueue_job", None)
+    is_avail = getattr(app_mod, "_is_agent_available_for_pin", None)
 
-    async def event_generator():
-        # Initial hello so the client knows the stream is alive (namespaced)
-        yield _sse_format("hello", {"ts": time.time(), "namespace": ns})
+    if state_lock is None or enqueue is None or is_avail is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Controller internals not available (STATE_LOCK/_enqueue_job/_is_agent_available_for_pin)",
+        )
 
-        last_keepalive = time.time()
+    pinned = None
+    if req.constraints and req.constraints.pinned_agent:
+        pinned = str(req.constraints.pinned_agent)
+
+    # Priority mapping
+    lvl = req.excitatory_level if req.excitatory_level is not None else req.priority
+    if lvl is None:
+        lvl = 1
+    try:
+        lvl_i = int(lvl)
+    except (TypeError, ValueError):
+        lvl_i = 1
+    lvl_i = max(0, min(3, lvl_i))
+
+    # Caller-supplied job id
+    caller_job_id = req.job_id or req.id
+
+    with state_lock:
+        if pinned:
+            try:
+                if not bool(is_avail(pinned)):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"error": "requested_agent_unavailable", "agent": pinned},
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                # If the health subsystem is broken, be conservative and reject pinning
+                raise HTTPException(status_code=409, detail={"error": "requested_agent_unavailable", "agent": pinned})
+
         try:
-            while True:
-                if await request.is_disconnected():
-                    break
+            job_id = enqueue(
+                op=str(req.op),
+                payload=req.payload,
+                job_id=str(caller_job_id) if caller_job_id else None,
+                pinned_agent=pinned,
+                excitatory_level=lvl_i,
+                namespace=ns,
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"enqueue failed: {type(e).__name__}: {e}")
 
-                timeout = max(0.1, _KEEPALIVE_INTERVAL_S - (time.time() - last_keepalive))
-                try:
-                    msg = await asyncio.wait_for(q.get(), timeout=timeout)
-                    yield msg
-                except asyncio.TimeoutError:
-                    yield f": keepalive {int(time.time())}\n\n"
-                    last_keepalive = time.time()
-        finally:
-            await _remove_subscriber(sub)
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    return CreateJobResponse(ok=True, job_id=str(job_id))
