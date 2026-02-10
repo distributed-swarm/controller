@@ -12,14 +12,17 @@ router = APIRouter()
 
 # ---------- helpers ----------
 
+def _require_namespace(namespace: Optional[str]) -> str:
+    ns = (namespace or "").strip()
+    if not ns:
+        raise HTTPException(status_code=400, detail="namespace is required")
+    return ns
+
+
 def _parse_since(since: Optional[str]) -> Optional[datetime]:
-    """
-    Accepts ISO-ish timestamps. If parsing fails, we treat it as invalid input.
-    """
     if not since:
         return None
     try:
-        # Handles "2026-01-13T12:34:56" and "2026-01-13T12:34:56Z" (strip Z)
         return datetime.fromisoformat(since.replace("Z", "+00:00"))
     except Exception:
         raise HTTPException(status_code=422, detail="since must be an ISO-8601 timestamp")
@@ -46,10 +49,8 @@ def _job_matches_filters(
             return False
 
     if agent:
-        # Try common fields. Your controller uses some combination of leased_by / pinned_agent / agent.
         leased_by = job.get("leased_by") or job.get("agent") or job.get("worker") or job.get("claimed_by")
         pinned = job.get("pinned_agent")
-        # If filtering by agent, match either who leased it OR who it's pinned to.
         if str(leased_by) != agent and str(pinned) != agent:
             return False
 
@@ -58,7 +59,6 @@ def _job_matches_filters(
             return False
 
     if since_dt:
-        # Prefer updated_at, fall back to created_at / submitted_at
         ts = job.get("updated_at") or job.get("created_at") or job.get("submitted_at")
         if not ts:
             return False
@@ -70,21 +70,31 @@ def _job_matches_filters(
             return False
 
     return True
-    
+
+
 def _load_stores() -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    Pull in-memory stores from the running app.py module.
+    Pull in-memory stores from the running app module.
+    IMPORTANT: This file may exist in repos where the runtime module is either
+    'app' (image build) or 'controller.app' (editable install).
+    We'll try both.
     """
-    try:
-        import app as app  # type: ignore
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Runtime module 'app' not available: {e}",
-        )
+    app_mod = None
+    err: Optional[Exception] = None
 
-    jobs = getattr(app, "JOBS", None)
-    agents = getattr(app, "AGENTS", None)
+    for modname in ("app", "controller.app"):
+        try:
+            app_mod = __import__(modname, fromlist=["*"])
+            break
+        except Exception as e:
+            err = e
+            continue
+
+    if app_mod is None:
+        raise HTTPException(status_code=500, detail=f"Runtime app module not available: {err}")
+
+    jobs = getattr(app_mod, "JOBS", None)
+    agents = getattr(app_mod, "AGENTS", None)
 
     if jobs is None or not isinstance(jobs, dict):
         jobs = {}
@@ -95,37 +105,27 @@ def _load_stores() -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
 
 def _normalize_job_for_v1(job: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Return a shallow copy of the job with v1-facing state naming.
-    """
     out = dict(job)
     out["state"] = _to_v1_state(str(job.get("status", "")))
-    # Keep original too, but the UI should use "state"
-    # out["status"] remains for backward visibility.
     if out.get("status") == "completed":
-        out["status"] = "completed"  # keep internal for debugging
+        out["status"] = "completed"
     return out
 
 
+def _agent_namespace(info: Dict[str, Any]) -> Optional[str]:
+    # Allow multiple shapes:
+    # - info["namespace"]
+    # - info["labels"]["namespace"]
+    ns = info.get("namespace")
+    if ns:
+        return str(ns)
+    labels = info.get("labels")
+    if isinstance(labels, dict) and labels.get("namespace"):
+        return str(labels.get("namespace"))
+    return None
+
+
 # ---------- response models ----------
-
-class JobView(BaseModel):
-    job_id: str
-    op: str
-    state: str
-    payload: Dict[str, Any] = Field(default_factory=dict)
-
-    # Optional metadata
-    pinned_agent: Optional[str] = None
-    leased_by: Optional[str] = None
-    created_at: Optional[str] = None
-    updated_at: Optional[str] = None
-    completed_at: Optional[str] = None
-
-    # Terminal outputs
-    result: Optional[Dict[str, Any]] = None
-    error: Optional[Dict[str, Any]] = None
-
 
 class JobsListResponse(BaseModel):
     jobs: List[Dict[str, Any]]
@@ -134,22 +134,29 @@ class JobsListResponse(BaseModel):
 # ---------- endpoints ----------
 
 @router.get("/jobs/{job_id}", response_model=Dict[str, Any])
-def get_job(job_id: str) -> Dict[str, Any]:
+def get_job(job_id: str, namespace: str = Query(..., description="Namespace (required)")) -> Dict[str, Any]:
     """
-    Single source of truth for one job (UI detail view).
+    Read one job. Namespace is required; mismatch returns 404 (no existence leak).
     """
+    ns = _require_namespace(namespace)
     jobs, _agents = _load_stores()
+
     job = jobs.get(job_id)
-    if not job:
+    if not job or not isinstance(job, dict):
         raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id}")
+
+    if str(job.get("namespace") or "") != ns:
+        # Do not leak that the job exists in another namespace
+        raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id}")
+
     out = _normalize_job_for_v1(job)
-    # Ensure job_id exists in output even if internal dict uses a different key.
     out.setdefault("job_id", job_id)
     return out
 
 
 @router.get("/jobs", response_model=JobsListResponse)
 def list_jobs(
+    namespace: str = Query(..., description="Namespace (required)"),
     state: Optional[str] = Query(default=None, description="Filter by state (queued|leased|running|succeeded|failed)"),
     agent: Optional[str] = Query(default=None, description="Filter by agent (leased_by or pinned_agent)"),
     op: Optional[str] = Query(default=None, description="Filter by op"),
@@ -157,21 +164,26 @@ def list_jobs(
     limit: int = Query(default=200, ge=1, le=5000, description="Max jobs returned"),
 ) -> JobsListResponse:
     """
-    List/filter jobs for UI tables. Read-only.
+    Namespace-filtered job list.
     """
+    ns = _require_namespace(namespace)
     since_dt = _parse_since(since)
+
     jobs, _agents = _load_stores()
 
     items: List[Dict[str, Any]] = []
     for jid, job in jobs.items():
         if not isinstance(job, dict):
             continue
+
+        if str(job.get("namespace") or "") != ns:
+            continue
+
         if _job_matches_filters(job, state, agent, op, since_dt):
             out = _normalize_job_for_v1(job)
             out.setdefault("job_id", jid)
             items.append(out)
 
-    # Sort newest-first by updated_at (fallback created_at)
     def sort_key(j: Dict[str, Any]) -> str:
         return str(j.get("updated_at") or j.get("created_at") or "")
 
@@ -183,27 +195,30 @@ def list_jobs(
 
 
 @router.get("/agents", response_model=Dict[str, Any])
-def list_agents() -> Dict[str, Any]:
+def list_agents(namespace: str = Query(..., description="Namespace (required)")) -> Dict[str, Any]:
     """
-    Return known agents (UI worker list).
+    Namespace-filtered agent list.
     """
-    jobs, agents = _load_stores()
-    out = []
+    ns = _require_namespace(namespace)
+    _jobs, agents = _load_stores()
+
+    out: List[Dict[str, Any]] = []
     for name, info in agents.items():
         row = dict(info or {})
         row["name"] = name
-        row["last_seen_at"] = info.get("last_seen")
+        row["last_seen_at"] = (info or {}).get("last_seen")
+
+        a_ns = _agent_namespace(row)
+        if a_ns != ns:
+            continue
+
         out.append(row)
+
     return {"agents": out}
+
+
 @router.delete("/agents/{agent_name}", response_model=Dict[str, Any])
 def delete_agent_v1(agent_name: str) -> Dict[str, Any]:
-    """
-    Hard-delete an agent from the in-memory AGENTS store.
-    Idempotent: returns ok even if the agent did not exist.
-    """
     from api.v1.agents import delete_agent  # local import avoids import-time coupling
-
     deleted = delete_agent(agent_name)
     return {"ok": True, "deleted": bool(deleted), "name": agent_name}
-    
-
