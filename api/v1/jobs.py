@@ -1,219 +1,153 @@
-# controller/api/v1/jobs.py
+# controller/api/v1/events.py
 from __future__ import annotations
 
-import threading
-import uuid
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+import asyncio
+import json
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
 router = APIRouter()
 
-# --- In-memory idempotency cache (good enough for now; DB later) ---
-# Maps idempotency_key -> job_id
-_IDEMPOTENCY: Dict[str, str] = {}
-_IDEMPOTENCY_LOCK = threading.Lock()
+
+@dataclass
+class _Subscriber:
+    q: asyncio.Queue
+    namespace: str
+    include_global: bool = False
 
 
-class JobSubmitRequest(BaseModel):
-    op: str = Field(..., description="Operation name (e.g. 'echo', 'hailo_infer', 'map_summarize').")
+# --- In-process pub/sub for SSE subscribers (namespace-filtered) ---
+_SUBSCRIBERS: List[_Subscriber] = []
+_SUBSCRIBERS_LOCK = asyncio.Lock()
 
-    # Back-compat: allow any JSON value, not just objects/dicts.
-    # Legacy /job accepted strings and other JSON scalars.
-    payload: Any = Field(default_factory=dict, description="Operation payload (any JSON value).")
+# Main event loop reference (used to publish from sync/threadpool contexts)
+_MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
-    # NEW: tenant/namespace for fairness scheduling (default = "default")
-    namespace: Optional[str] = Field(
-        default=None,
-        description="Tenant/namespace for fairness scheduling. Defaults to 'default'.",
-    )
-
-    # Optional scheduling knobs
-    constraints: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description="Scheduling constraints (optional). Stored/passed through for now.",
-    )
-    priority: Optional[int] = Field(
-        default=1,
-        ge=0,
-        le=3,
-        description="Priority 0..3 (maps to controller excitatory_level).",
-    )
-    pinned_agent: Optional[str] = Field(
-        default=None,
-        description="If set, only this agent may lease the job.",
-    )
-
-    # NEW: per-job lease TTL override (seconds)
-    lease_timeout_s: Optional[int] = Field(
-        default=None,
-        ge=1,
-        le=3600,
-        description="Optional per-job lease timeout in seconds (overrides controller default).",
-    )
-
-    # Optional safety knob for flaky clients / retries
-    idempotency_key: Optional[str] = Field(
-        default=None,
-        description="If provided, retries with the same key return the same job_id.",
-    )
+# How often to send keepalive comments (seconds)
+_KEEPALIVE_INTERVAL_S = 15.0
 
 
-class JobSubmitResponse(BaseModel):
-    job_id: str
+def _sse_format(event_type: str, data: Dict[str, Any]) -> str:
+    payload = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+    return f"event: {event_type}\ndata: {payload}\n\n"
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+async def _add_subscriber(sub: _Subscriber) -> None:
+    async with _SUBSCRIBERS_LOCK:
+        _SUBSCRIBERS.append(sub)
 
 
-def _publish_job_created_event(job_id: str, req: JobSubmitRequest, payload: Any, namespace: str) -> None:
-    """
-    Best-effort: emit job.created via SSE. Must never break job submission.
-    """
-    try:
-        from api.v1.events import publish_event  # deferred to avoid circular imports
-    except Exception:
-        return
-
-    # Avoid leaking huge payloads into SSE; only send a tiny preview.
-    payload_preview = None
-    try:
-        if payload is not None:
-            payload_preview = str(payload)[:100]
-    except Exception:
-        payload_preview = "<unprintable>"
-
-    try:
-        publish_event(
-            "job.created",
-            {
-                "job_id": job_id,
-                "op": req.op,
-                "namespace": namespace,
-                "state": "queued",
-                "priority": req.priority if req.priority is not None else 1,
-                "constraints": req.constraints,
-                "pinned_agent": req.pinned_agent,
-                "lease_timeout_s": req.lease_timeout_s,
-                "payload_preview": payload_preview,
-                "created_at": _now_iso(),
-            },
-        )
-    except Exception:
-        return
-
-
-def _best_effort_set_job_field(job_id: str, key: str, value: Any) -> None:
-    """
-    Controller compatibility shim:
-    - If controller internals expose JOBS and STATE_LOCK, patch the stored job dict.
-    Never raises.
-    """
-    try:
-        import app  # type: ignore
-    except Exception:
-        return
-
-    jobs = getattr(app, "JOBS", None)
-    lock = getattr(app, "STATE_LOCK", None)
-    if not isinstance(jobs, dict) or lock is None:
-        return
-
-    try:
-        with lock:
-            j = jobs.get(job_id)
-            if isinstance(j, dict):
-                j[key] = value
-    except Exception:
-        return
-
-
-@router.post("/jobs", response_model=JobSubmitResponse)
-def submit_job(req: JobSubmitRequest) -> JobSubmitResponse:
-    """
-    Submit a job into the controller.
-
-    Logic:
-    - If idempotency_key is provided and we've seen it, return the same job_id.
-    - Otherwise generate a job_id and enqueue the job via the controller's existing enqueue function.
-    - Persist lease_timeout_s on the stored job dict (even if enqueue signature doesn't accept it).
-    - Persist namespace on the stored job dict.
-    - Emit SSE event: job.created (best-effort).
-    """
-    # Idempotency: same key => same job_id
-    if req.idempotency_key:
-        with _IDEMPOTENCY_LOCK:
-            existing = _IDEMPOTENCY.get(req.idempotency_key)
-            if existing:
-                return JobSubmitResponse(job_id=existing)
-
-    job_id = str(uuid.uuid4())
-
-    # Normalize namespace (always non-empty)
-    namespace = (req.namespace or "default").strip() or "default"
-
-    # Defer importing controller internals to avoid circular imports until we wire everything.
-    try:
-        # app.py defines: _enqueue_job(op, payload, job_id=None, pinned_agent=None, excitatory_level=1) -> job_id
-        from app import _enqueue_job  # type: ignore
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Runtime enqueue function not available: {e}")
-
-    # Back-compat payload handling:
-    # - Accept dict/list/string/number/etc.
-    # - Preserve constraints:
-    #   - If payload is a dict, inject _constraints
-    #   - Otherwise wrap as {"value": payload, "_constraints": constraints}
-    payload: Any = req.payload
-    if payload is None:
-        payload = {}
-
-    if req.constraints is not None:
-        if isinstance(payload, dict):
-            payload.setdefault("_constraints", req.constraints)
-        else:
-            payload = {"value": payload, "_constraints": req.constraints}
-
-    # Enqueue job (try keyword path first; fall back to positional signature)
-    try:
-        _enqueue_job(
-            op=req.op,
-            payload=payload,
-            job_id=job_id,
-            pinned_agent=req.pinned_agent,
-            excitatory_level=req.priority if req.priority is not None else 1,
-            lease_timeout_s=req.lease_timeout_s,  # may not exist in signature; handled below
-        )
-    except TypeError:
-        # Controller signature doesn't accept lease_timeout_s (current app.py).
+async def _remove_subscriber(sub: _Subscriber) -> None:
+    async with _SUBSCRIBERS_LOCK:
         try:
-            _enqueue_job(
-                req.op,
-                payload,
-                job_id,
-                req.pinned_agent,
-                req.priority if req.priority is not None else 1,
-            )
-        except Exception as e2:
-            raise HTTPException(status_code=500, detail=f"Failed to enqueue job: {e2}")
+            _SUBSCRIBERS.remove(sub)
+        except ValueError:
+            pass
 
-        # Ensure TTL is written into stored job dict so reaper/leases use it
-        if req.lease_timeout_s is not None:
-            _best_effort_set_job_field(job_id, "lease_timeout_s", int(req.lease_timeout_s))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to enqueue job: {e}")
 
-    # Persist namespace onto the job record (best-effort; must not break submit)
-    _best_effort_set_job_field(job_id, "namespace", namespace)
+async def _broadcast(event_type: str, data: Dict[str, Any]) -> None:
+    """
+    Namespace-filtered fan-out.
 
-    if req.idempotency_key:
-        with _IDEMPOTENCY_LOCK:
-            _IDEMPOTENCY[req.idempotency_key] = job_id
+    Rule:
+      - If event has data["namespace"] == "<ns>", deliver only to subscribers of that ns.
+      - If event has no namespace or namespace is None => "global event"
+        deliver only to subscribers with include_global=True.
+    """
+    ev_ns = data.get("namespace")
+    msg = _sse_format(event_type, data)
 
-    # Best-effort SSE event
-    _publish_job_created_event(job_id=job_id, req=req, payload=payload, namespace=namespace)
+    async with _SUBSCRIBERS_LOCK:
+        subs = list(_SUBSCRIBERS)
 
-    return JobSubmitResponse(job_id=job_id)
+    for sub in subs:
+        if ev_ns is None:
+            if not sub.include_global:
+                continue
+        else:
+            if str(ev_ns) != sub.namespace:
+                continue
+        try:
+            sub.q.put_nowait(msg)
+        except asyncio.QueueFull:
+            pass
+
+
+def publish_event(event_type: str, data: Dict[str, Any]) -> None:
+    """
+    Best-effort publish; safe from async or sync contexts.
+    """
+    global _MAIN_LOOP
+
+    # Fast exit if nobody is listening.
+    try:
+        if not _SUBSCRIBERS:
+            return
+    except Exception:
+        return
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_broadcast(event_type, data))
+        return
+    except RuntimeError:
+        pass
+
+    if _MAIN_LOOP is None:
+        return
+
+    try:
+        _MAIN_LOOP.call_soon_threadsafe(asyncio.create_task, _broadcast(event_type, data))
+    except Exception:
+        return
+
+
+@router.get("/events")
+async def sse_events(request: Request, namespace: str, include_global: bool = False) -> StreamingResponse:
+    """
+    SSE stream (namespace-filtered).
+    Requires namespace to prevent cross-tenant leakage.
+    """
+    ns = (namespace or "").strip()
+    if not ns:
+        raise HTTPException(status_code=400, detail="namespace is required")
+
+    global _MAIN_LOOP
+    try:
+        _MAIN_LOOP = asyncio.get_running_loop()
+    except Exception:
+        pass
+
+    q: asyncio.Queue = asyncio.Queue(maxsize=200)
+    sub = _Subscriber(q=q, namespace=ns, include_global=bool(include_global))
+    await _add_subscriber(sub)
+
+    async def event_generator():
+        # Initial hello so the client knows the stream is alive (namespaced)
+        yield _sse_format("hello", {"ts": time.time(), "namespace": ns})
+
+        last_keepalive = time.time()
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+
+                timeout = max(0.1, _KEEPALIVE_INTERVAL_S - (time.time() - last_keepalive))
+                try:
+                    msg = await asyncio.wait_for(q.get(), timeout=timeout)
+                    yield msg
+                except asyncio.TimeoutError:
+                    yield f": keepalive {int(time.time())}\n\n"
+                    last_keepalive = time.time()
+        finally:
+            await _remove_subscriber(sub)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
