@@ -24,6 +24,12 @@ class JobSubmitRequest(BaseModel):
     # Legacy /job accepted strings and other JSON scalars.
     payload: Any = Field(default_factory=dict, description="Operation payload (any JSON value).")
 
+    # NEW: tenant/namespace for fairness scheduling (default = "default")
+    namespace: Optional[str] = Field(
+        default=None,
+        description="Tenant/namespace for fairness scheduling. Defaults to 'default'.",
+    )
+
     # Optional scheduling knobs
     constraints: Optional[Dict[str, Any]] = Field(
         default=None,
@@ -63,7 +69,7 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _publish_job_created_event(job_id: str, req: JobSubmitRequest, payload: Any) -> None:
+def _publish_job_created_event(job_id: str, req: JobSubmitRequest, payload: Any, namespace: str) -> None:
     """
     Best-effort: emit job.created via SSE. Must never break job submission.
     """
@@ -86,6 +92,7 @@ def _publish_job_created_event(job_id: str, req: JobSubmitRequest, payload: Any)
             {
                 "job_id": job_id,
                 "op": req.op,
+                "namespace": namespace,
                 "state": "queued",
                 "priority": req.priority if req.priority is not None else 1,
                 "constraints": req.constraints,
@@ -133,6 +140,7 @@ def submit_job(req: JobSubmitRequest) -> JobSubmitResponse:
     - If idempotency_key is provided and we've seen it, return the same job_id.
     - Otherwise generate a job_id and enqueue the job via the controller's existing enqueue function.
     - Persist lease_timeout_s on the stored job dict (even if enqueue signature doesn't accept it).
+    - Persist namespace on the stored job dict.
     - Emit SSE event: job.created (best-effort).
     """
     # Idempotency: same key => same job_id
@@ -143,6 +151,9 @@ def submit_job(req: JobSubmitRequest) -> JobSubmitResponse:
                 return JobSubmitResponse(job_id=existing)
 
     job_id = str(uuid.uuid4())
+
+    # Normalize namespace (always non-empty)
+    namespace = (req.namespace or "default").strip() or "default"
 
     # Defer importing controller internals to avoid circular imports until we wire everything.
     try:
@@ -195,11 +206,14 @@ def submit_job(req: JobSubmitRequest) -> JobSubmitResponse:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to enqueue job: {e}")
 
+    # Persist namespace onto the job record (best-effort; must not break submit)
+    _best_effort_set_job_field(job_id, "namespace", namespace)
+
     if req.idempotency_key:
         with _IDEMPOTENCY_LOCK:
             _IDEMPOTENCY[req.idempotency_key] = job_id
 
     # Best-effort SSE event
-    _publish_job_created_event(job_id=job_id, req=req, payload=payload)
+    _publish_job_created_event(job_id=job_id, req=req, payload=payload, namespace=namespace)
 
     return JobSubmitResponse(job_id=job_id)
