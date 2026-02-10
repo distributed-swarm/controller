@@ -13,7 +13,7 @@ from .events import router as events_router
 from .reclamation.agents import router as reclamation_agents_router
 from .heartbeat import router as heartbeat_router
 
-# Write endpoints
+# Write endpoints (mutations)
 router.include_router(jobs_router, tags=["v1/jobs"])
 router.include_router(leases_router, tags=["v1/leases"])
 router.include_router(results_router, tags=["v1/results"])
