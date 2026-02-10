@@ -4,15 +4,24 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 router = APIRouter()
 
-# --- Simple in-process pub/sub for SSE subscribers ---
-_SUBSCRIBERS: List[asyncio.Queue] = []
+
+@dataclass
+class _Subscriber:
+    q: asyncio.Queue
+    namespace: str
+    include_global: bool = False
+
+
+# --- In-process pub/sub for SSE subscribers (namespace-filtered) ---
+_SUBSCRIBERS: List[_Subscriber] = []
 _SUBSCRIBERS_LOCK = asyncio.Lock()
 
 # Main event loop reference (used to publish from sync/threadpool contexts)
@@ -23,109 +32,105 @@ _KEEPALIVE_INTERVAL_S = 15.0
 
 
 def _sse_format(event_type: str, data: Dict[str, Any]) -> str:
-    """
-    SSE format: event + data + blank line.
-    'data:' must be single-line. JSON dumps is fine.
-    """
     payload = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
     return f"event: {event_type}\ndata: {payload}\n\n"
 
 
-async def _add_subscriber(q: asyncio.Queue) -> None:
+async def _add_subscriber(sub: _Subscriber) -> None:
     async with _SUBSCRIBERS_LOCK:
-        _SUBSCRIBERS.append(q)
+        _SUBSCRIBERS.append(sub)
 
 
-async def _remove_subscriber(q: asyncio.Queue) -> None:
+async def _remove_subscriber(sub: _Subscriber) -> None:
     async with _SUBSCRIBERS_LOCK:
         try:
-            _SUBSCRIBERS.remove(q)
+            _SUBSCRIBERS.remove(sub)
         except ValueError:
             pass
 
 
-async def _broadcast(msg: str) -> None:
+async def _broadcast(event_type: str, data: Dict[str, Any]) -> None:
     """
-    Fan-out message to all subscribers.
-    If a queue is full/unresponsive, drop the message for that subscriber.
-    """
-    # Copy subscribers under lock, then fan-out without holding the lock.
-    async with _SUBSCRIBERS_LOCK:
-        subscribers = list(_SUBSCRIBERS)
+    Namespace-filtered fan-out.
 
-    for q in subscribers:
+    Rule:
+      - If event has data["namespace"] == "<ns>", deliver only to subscribers of that ns.
+      - If event has no namespace or namespace is None => "global event"
+        deliver only to subscribers with include_global=True.
+    """
+    ev_ns = data.get("namespace")
+    msg = _sse_format(event_type, data)
+
+    async with _SUBSCRIBERS_LOCK:
+        subs = list(_SUBSCRIBERS)
+
+    for sub in subs:
+        if ev_ns is None:
+            if not sub.include_global:
+                continue
+        else:
+            if str(ev_ns) != sub.namespace:
+                continue
         try:
-            q.put_nowait(msg)
+            sub.q.put_nowait(msg)
         except asyncio.QueueFull:
             pass
 
 
 def publish_event(event_type: str, data: Dict[str, Any]) -> None:
     """
-    Publish an SSE event to all connected clients.
-
-    Safe to call from:
-    - async endpoints (has running loop)
-    - sync endpoints (threadpool; no running loop)
-
-    Best-effort: if no loop exists yet (no /events clients connected),
-    it no-ops rather than crashing.
+    Best-effort publish; safe from async or sync contexts.
     """
     global _MAIN_LOOP
 
-    msg = _sse_format(event_type, data)
-
-    # Fast exit: nothing to do if nobody is listening.
-    # (Also avoids doing loop scheduling work when unused.)
+    # Fast exit if nobody is listening.
     try:
-        # Avoid locking here; worst case we schedule broadcast and it finds nobody.
         if not _SUBSCRIBERS:
             return
     except Exception:
-        # If something weird happens, keep best-effort behavior.
         return
 
-    # If we're already on an event loop (async context), schedule directly.
     try:
         loop = asyncio.get_running_loop()
-        loop.create_task(_broadcast(msg))
+        loop.create_task(_broadcast(event_type, data))
         return
     except RuntimeError:
-        pass  # Not in an event loop (likely threadpool)
+        pass
 
-    # Threadpool / sync context path: schedule on the main loop if we have it.
     if _MAIN_LOOP is None:
         return
 
     try:
-        _MAIN_LOOP.call_soon_threadsafe(asyncio.create_task, _broadcast(msg))
+        _MAIN_LOOP.call_soon_threadsafe(asyncio.create_task, _broadcast(event_type, data))
     except Exception:
-        # Don't ever break API calls because SSE had a bad day.
         return
 
 
 @router.get("/events")
-async def sse_events(request: Request) -> StreamingResponse:
+async def sse_events(request: Request, namespace: str, include_global: bool = False) -> StreamingResponse:
     """
-    SSE stream emitting events (e.g., job.created, job.leased, job.completed)
-    plus keepalive pings.
+    SSE stream (namespace-filtered).
+    Requires namespace to prevent cross-tenant leakage.
     """
+    ns = (namespace or "").strip()
+    if not ns:
+        raise HTTPException(status_code=400, detail="namespace is required")
+
     global _MAIN_LOOP
     try:
         _MAIN_LOOP = asyncio.get_running_loop()
     except Exception:
-        # In practice, this should always succeed in ASGI.
         pass
 
     q: asyncio.Queue = asyncio.Queue(maxsize=200)
-    await _add_subscriber(q)
+    sub = _Subscriber(q=q, namespace=ns, include_global=bool(include_global))
+    await _add_subscriber(sub)
 
     async def event_generator():
-        # Initial hello so the client knows the stream is alive
-        yield _sse_format("hello", {"ts": time.time()})
+        # Initial hello so the client knows the stream is alive (namespaced)
+        yield _sse_format("hello", {"ts": time.time(), "namespace": ns})
 
         last_keepalive = time.time()
-
         try:
             while True:
                 if await request.is_disconnected():
@@ -136,17 +141,13 @@ async def sse_events(request: Request) -> StreamingResponse:
                     msg = await asyncio.wait_for(q.get(), timeout=timeout)
                     yield msg
                 except asyncio.TimeoutError:
-                    # Keepalive comment (SSE ignores lines starting with :)
                     yield f": keepalive {int(time.time())}\n\n"
                     last_keepalive = time.time()
         finally:
-            await _remove_subscriber(q)
+            await _remove_subscriber(sub)
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # helps reverse proxies not buffer SSE
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
