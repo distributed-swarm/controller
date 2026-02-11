@@ -10,7 +10,6 @@ from .leases import router as leases_router
 from .results import router as results_router
 from .read import router as read_router
 from .events import router as events_router
-from .reclamation.agents import router as reclamation_agents_router
 from .heartbeat import router as heartbeat_router
 from .state import AGENTS, JOBS, STATE_LOCK
 
