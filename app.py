@@ -27,12 +27,12 @@ RECLAIM_INTERVAL_SEC = 30
 @app.on_event("startup")
 async def start_reclaimer():
     # “A” mode: in-memory agent reaper loop
+    print("[startup] starting agent reaper")
     start_reaper(
         agents=AGENTS,
         jobs=JOBS,
         publish_event=publish_event,
         lock=STATE_LOCK,
-        print("[startup] starting agent reaper")
     )
 # -----------------------------------------------------------------------------
 # Brainstem (stable scheduling policy)
