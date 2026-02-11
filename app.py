@@ -12,6 +12,7 @@ from starlette.responses import Response
 from api.v1.events import publish_event
 from api.v1 import router as v1_router
 from api.v1.reaper import start_reaper  # adjust name if your function differs
+from api.v1 import AGENTS, JOBS, STATE_LOCK
 
 from pipelines.engine import run_text_pipeline
 from pipelines.spec import IntakeRequest
@@ -31,6 +32,7 @@ async def start_reclaimer():
         jobs=JOBS,
         publish_event=publish_event,
         lock=STATE_LOCK,
+        print("[startup] starting agent reaper")
     )
 # -----------------------------------------------------------------------------
 # Brainstem (stable scheduling policy)
@@ -39,12 +41,6 @@ BRAIN = Brainstem()
 ENABLE_LATERAL_INHIBITION = True  # flip False for instant rollback
 
 # -----------------------------------------------------------------------------
-# In-memory state
-# -----------------------------------------------------------------------------
-STATE_LOCK = threading.Lock()
-
-AGENTS: Dict[str, Dict[str, Any]] = {}
-JOBS: Dict[str, Dict[str, Any]] = {}
 
 # Multiple priority queues by excitatory level (0..3)
 # 3 = Reflex (Immediate SAP Trigger)
