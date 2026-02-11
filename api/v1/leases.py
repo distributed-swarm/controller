@@ -275,14 +275,29 @@ def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
         raise HTTPException(status_code=400, detail="namespace is required")
 
     # --- Namespace fence: stored agent namespace is authoritative ---
+    # The agent registry is namespace-scoped, so get_agent(req.agent) may not find an
+    # agent that exists under a *different* namespace. We must scan for the agent name
+    # across namespaces and prevent cross-namespace leasing.
     existing_ns: Optional[str] = None
     try:
-        from api.v1.agents import get_agent  # type: ignore
-        existing = get_agent(req.agent)  # dict-like or None
-        if isinstance(existing, dict):
-            labels = existing.get("labels") or {}
-            if isinstance(labels, dict):
-                existing_ns = labels.get("namespace")
+        import api.v1.agents as agents_mod  # type: ignore
+
+        # Try any exported helper first (may or may not be namespace-aware)
+        getter = getattr(agents_mod, "get_agent", None)
+        if callable(getter):
+            existing = getter(req.agent)
+            if isinstance(existing, dict):
+                labels = existing.get("labels") or {}
+                if isinstance(labels, dict):
+                    existing_ns = labels.get("namespace")
+
+        # Authoritative scan across namespaces (AGENTS is the in-memory store)
+        store = getattr(agents_mod, "AGENTS", None) or getattr(agents_mod, "_AGENTS", None)
+        if isinstance(store, dict):
+            for ns_key, by_name in store.items():
+                if isinstance(by_name, dict) and req.agent in by_name:
+                    existing_ns = str(ns_key)
+                    break
     except Exception:
         existing_ns = None
 
@@ -299,6 +314,7 @@ def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
             )
         ns = str(existing_ns)
     # ---------------------------------------------------------------
+
 
     _upsert_agent_from_lease(req)
 
