@@ -12,6 +12,7 @@ from .read import router as read_router
 from .events import router as events_router
 from .reclamation.agents import router as reclamation_agents_router
 from .heartbeat import router as heartbeat_router
+from .state import AGENTS, JOBS, STATE_LOCK
 
 # Write endpoints (mutations)
 router.include_router(jobs_router, tags=["v1/jobs"])
