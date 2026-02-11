@@ -11,7 +11,7 @@ from starlette.responses import Response
 
 from api.v1.events import publish_event
 from api.v1 import router as v1_router
-from api.v1.reclamation.agents import sweep_agents
+from api.v1.reaper import start_reaper  # adjust name if your function differs
 
 from pipelines.engine import run_text_pipeline
 from pipelines.spec import IntakeRequest
@@ -25,13 +25,13 @@ RECLAIM_INTERVAL_SEC = 30
 
 @app.on_event("startup")
 async def start_reclaimer():
-    async def loop():
-        while True:
-            sweep_agents(dry_run=False)
-            await asyncio.sleep(RECLAIM_INTERVAL_SEC)
-
-    asyncio.create_task(loop())
-
+    # “A” mode: in-memory agent reaper loop
+    start_reaper(
+        agents=AGENTS,
+        jobs=JOBS,
+        publish_event=publish_event,
+        lock=STATE_LOCK,
+    )
 # -----------------------------------------------------------------------------
 # Brainstem (stable scheduling policy)
 # -----------------------------------------------------------------------------
