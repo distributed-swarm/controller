@@ -274,7 +274,34 @@ def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
     if not ns:
         raise HTTPException(status_code=400, detail="namespace is required")
 
+    # --- Namespace fence: stored agent namespace is authoritative ---
+    existing_ns: Optional[str] = None
+    try:
+        from api.v1.agents import get_agent  # type: ignore
+        existing = get_agent(req.agent)  # dict-like or None
+        if isinstance(existing, dict):
+            labels = existing.get("labels") or {}
+            if isinstance(labels, dict):
+                existing_ns = labels.get("namespace")
+    except Exception:
+        existing_ns = None
+
+    if existing_ns:
+        if str(existing_ns) != str(ns):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "AGENT_NAMESPACE_MISMATCH",
+                    "agent": req.agent,
+                    "agent_namespace": existing_ns,
+                    "requested_namespace": ns,
+                },
+            )
+        ns = str(existing_ns)
+    # ---------------------------------------------------------------
+
     _upsert_agent_from_lease(req)
+
 
     try:
         import app as app_mod  # type: ignore
