@@ -139,6 +139,30 @@ def _upsert_agent_from_lease(req: LeaseRequest) -> None:
     except Exception:
         return
 
+    # Try to read existing agent record to prevent namespace flip-flopping
+    existing_ns: Optional[str] = None
+    try:
+        from api.v1.agents import get_agent  # type: ignore
+        existing = get_agent(req.agent)  # expected to return dict-like or None
+        if isinstance(existing, dict):
+            labels = existing.get("labels") or {}
+            if isinstance(labels, dict):
+                existing_ns = labels.get("namespace")
+    except Exception:
+        existing_ns = None
+
+    # If agent exists, namespace must be stable
+    if existing_ns and str(existing_ns) != str(req.namespace):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "AGENT_NAMESPACE_MISMATCH",
+                "agent": req.agent,
+                "agent_namespace": existing_ns,
+                "requested_namespace": req.namespace,
+            },
+        )
+
     caps = req.capabilities
     if isinstance(caps, dict):
         caps = caps.get("ops") or []
