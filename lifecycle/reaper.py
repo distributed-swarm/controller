@@ -19,6 +19,7 @@
 import os
 import time
 import threading
+from api.v1.agents import delete_agent
 from dataclasses import dataclass
 from typing import Dict, Any, Callable, Optional
 
@@ -126,7 +127,7 @@ def start_reaper(
                             to_delete.append(name)
 
                 for name in to_delete:
-                    agents.pop(name, None)
+                    delete_agent(agents, name)
                     publish_event(
                         "agent.deleted",
                         {
