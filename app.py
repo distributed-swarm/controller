@@ -11,7 +11,7 @@ from starlette.responses import Response
 
 from api.v1.events import publish_event
 from api.v1 import router as v1_router
-from api.v1.reaper import start_reaper  # adjust name if your function differs
+from lifecycle import start_reaper
 from api.v1 import AGENTS, JOBS, STATE_LOCK
 
 from pipelines.engine import run_text_pipeline
