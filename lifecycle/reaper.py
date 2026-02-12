@@ -50,16 +50,16 @@ def start_reaper(
     publish_event: Callable[[str, Dict[str, Any]], None],
     lock: threading.Lock,
 ) -> threading.Thread:
+    
     """
     agents: mapping agent_name -> agent_record
       agent_record SHOULD contain last_seen: float (unix seconds)  [controller-native]
       agent_record MAY contain last_heartbeat_ts: float (unix seconds) [compat]
       agent_record MAY contain _reap: AgentReapMeta (we add if missing)
 
-    jobs: mapping job_id -> job_record with:
-      leased_by: Optional[str]
-      lease_expires_at: Optional[float]  (unix seconds)
-      
+    jobs: mapping job_id -> job_record
+      The reaper does not mutate job/lease state. Lease recovery is handled by TTL + scheduler logic.
+
     publish_event(event_name, data)
     lock: same lock used by request handlers for agents/jobs stores
     """
