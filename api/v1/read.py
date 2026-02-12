@@ -104,6 +104,35 @@ def _agent_namespace(info: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _is_active_agent(info: Dict[str, Any]) -> bool:
+    """
+    Active means: not tombstoned and (if lifecycle metadata exists) state == alive.
+
+    We honor both:
+      - tombstoned_at (api/v1/agents tombstone field)
+      - _reap.state (lifecycle reaper metadata: alive/stale/tombstoned)
+    """
+    # If other subsystems explicitly tombstone agents, honor it.
+    if info.get("tombstoned_at") is not None:
+        return False
+
+    meta = info.get("_reap")
+
+    # Most common: dict persisted in AGENTS store
+    if isinstance(meta, dict):
+        state = (meta.get("state") or "").lower()
+        if state and state != "alive":
+            return False
+        return True
+
+    # Defensive: if meta is ever a dataclass instance
+    state = (getattr(meta, "state", "") or "").lower()
+    if state and state != "alive":
+        return False
+
+    return True
+
+
 class JobsListResponse(BaseModel):
     jobs: List[Dict[str, Any]]
 
@@ -156,7 +185,10 @@ def list_jobs(
 
 
 @router.get("/agents", response_model=Dict[str, Any])
-def list_agents(namespace: str = Query(..., description="Namespace (required)")) -> Dict[str, Any]:
+def list_agents(
+    namespace: str = Query(..., description="Namespace (required)"),
+    include_tombstoned: bool = Query(default=False, description="Include stale/tombstoned agents"),
+) -> Dict[str, Any]:
     ns = _require_namespace(namespace)
     _jobs, agents = _load_stores()
 
@@ -164,9 +196,14 @@ def list_agents(namespace: str = Query(..., description="Namespace (required)"))
     for name, info in agents.items():
         row = dict(info or {})
         row["name"] = name
+
         a_ns = _agent_namespace(row)
         if a_ns != ns:
             continue
+
+        if not include_tombstoned and not _is_active_agent(row):
+            continue
+
         out.append(row)
 
     return {"agents": out}
