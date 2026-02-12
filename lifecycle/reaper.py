@@ -59,8 +59,7 @@ def start_reaper(
     jobs: mapping job_id -> job_record with:
       leased_by: Optional[str]
       lease_expires_at: Optional[float]  (unix seconds)
-      state/status fields may exist; we only force lease expiry
-
+      
     publish_event(event_name, data)
     lock: same lock used by request handlers for agents/jobs stores
     """
@@ -101,19 +100,6 @@ def start_reaper(
                                 "stale_after_s": STALE_AFTER_S,
                             },
                         )
-
-                        # Force-expire any leases held by this agent (requeue now)
-                        for job_id, job in jobs.items():
-                            if job.get("leased_by") == name:
-                                job["lease_expires_at"] = 0.0
-                                publish_event(
-                                    "lease.forced_expire",
-                                    {
-                                        "job_id": job_id,
-                                        "agent": name,
-                                        "reason": "agent_stale",
-                                    },
-                                )
 
                     # STALE -> TOMBSTONED
                     if meta.state == AGENT_STALE and meta.stale_since_ts is not None:
