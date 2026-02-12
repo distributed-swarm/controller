@@ -106,6 +106,10 @@ def start_reaper(
                         if (now - meta.stale_since_ts) > TOMBSTONE_AFTER_S:
                             meta.state = AGENT_TOMBSTONED
                             meta.tombstoned_ts = now
+                            
+                            a["tombstoned_at"] = now
+                            a["tombstone_reason"] = "reaper"
+                            
                             publish_event(
                                 "agent.tombstoned",
                                 {
