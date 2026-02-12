@@ -1,4 +1,21 @@
-# api/v1/reaper.py
+# lifecycle/reaper.py
+#
+# The Reaper walks quietly.
+#
+# It does not schedule.
+# It does not judge.
+# It does not cancel.
+#
+# It simply observes who has stopped breathing,
+# marks the time,
+# and ensures the system does not lie about the dead.
+#
+# Agents go: alive → stale → tombstoned → deleted.
+#
+# No drama.
+# No zombies.
+# No ghosts.
+
 import os
 import time
 import threading
