@@ -6,6 +6,6 @@ The agent reaper is domain lifecycle logic and lives in controller/lifecycle/rea
 This module remains only to avoid breaking older imports during the transition.
 """
 
-from lifecycle.reaper import start_reaper
+from lifecycle/reaper import start_reaper
 
 __all__ = ["start_reaper"]
