@@ -19,9 +19,10 @@
 import os
 import time
 import threading
-from api.v1.agents import delete_agent
 from dataclasses import dataclass
 from typing import Dict, Any, Callable, Optional
+
+from api.v1.agents import tombstone_agent, delete_agent
 
 
 REAPER_INTERVAL_S = float(os.getenv("REAPER_INTERVAL_S", "2"))
@@ -51,18 +52,17 @@ def start_reaper(
     publish_event: Callable[[str, Dict[str, Any]], None],
     lock: threading.Lock,
 ) -> threading.Thread:
-    
     """
     agents: mapping agent_name -> agent_record
-      agent_record SHOULD contain last_seen: float (unix seconds)  [controller-native]
-      agent_record MAY contain last_heartbeat_ts: float (unix seconds) [compat]
-      agent_record MAY contain _reap: AgentReapMeta (we add if missing)
+      agent_record SHOULD contain last_seen: float (unix seconds)
+      agent_record MAY contain last_heartbeat_ts: float (compat)
+      agent_record MAY contain _reap: AgentReapMeta (added if missing)
 
     jobs: mapping job_id -> job_record
-      The reaper does not mutate job/lease state. Lease recovery is handled by TTL + scheduler logic.
+      Reaper does not mutate job/lease state.
 
     publish_event(event_name, data)
-    lock: same lock used by request handlers for agents/jobs stores
+    lock: same lock used by request handlers
     """
 
     def loop() -> None:
@@ -79,15 +79,16 @@ def start_reaper(
                         meta = AgentReapMeta()
                         a["_reap"] = meta
 
-                    # Prefer controller-native field name, but accept older/newer variants
+                    # Prefer controller-native field
                     last = a.get("last_seen")
                     if last is None:
                         last = a.get("last_heartbeat_ts")
                     if last is None:
-                        # If an agent record has no heartbeat timestamp at all, treat as dead.
-                        last = 0.0
+                        last = 0.0  # No heartbeat at all → dead
 
+                    # ---------------------------
                     # ALIVE -> STALE
+                    # ---------------------------
                     if meta.state == AGENT_ALIVE and (now - float(last)) > STALE_AFTER_S:
                         meta.state = AGENT_STALE
                         meta.stale_since_ts = now
@@ -102,40 +103,28 @@ def start_reaper(
                             },
                         )
 
+                    # ---------------------------
                     # STALE -> TOMBSTONED
+                    # ---------------------------
                     if meta.state == AGENT_STALE and meta.stale_since_ts is not None:
                         if (now - meta.stale_since_ts) > TOMBSTONE_AFTER_S:
                             meta.state = AGENT_TOMBSTONED
                             meta.tombstoned_ts = now
-                            
-                            a["tombstoned_at"] = now
-                            a["tombstone_reason"] = "reaper"
-                            
-                            publish_event(
-                                "agent.tombstoned",
-                                {
-                                    "agent": name,
-                                    "stale_since_ts": meta.stale_since_ts,
-                                    "now": now,
-                                    "tombstone_after_s": TOMBSTONE_AFTER_S,
-                                },
-                            )
 
+                            # Use canonical helper (emits event internally)
+                            tombstone_agent(name, reason="reaper")
+
+                    # ---------------------------
                     # TOMBSTONED -> DELETE
+                    # ---------------------------
                     if meta.state == AGENT_TOMBSTONED and meta.tombstoned_ts is not None:
                         if (now - meta.tombstoned_ts) > DELETE_AFTER_S:
                             to_delete.append(name)
 
+                # Perform deletions outside iteration
                 for name in to_delete:
-                    delete_agent(agents, name)
-                    publish_event(
-                        "agent.deleted",
-                        {
-                            "agent": name,
-                            "now": now,
-                            "delete_after_s": DELETE_AFTER_S,
-                        },
-                    )
+                    # Canonical delete helper (emits event internally)
+                    delete_agent(name)
 
     t = threading.Thread(target=loop, name="agent-reaper", daemon=True)
     t.start()
