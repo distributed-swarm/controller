@@ -8,6 +8,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.responses import PlainTextResponse, JSONResponse
 from starlette.responses import Response
+from fastapi.exceptions import RequestValidationError
 
 from api.v1.events import publish_event
 from api.v1 import router as v1_router
@@ -20,6 +21,19 @@ from connectors.ingress_http import parse_intake_body
 from brainstem import Brainstem
 
 app = FastAPI(title="Distributed Swarm Controller")
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    errors = exc.errors()
+    for e in errors:
+        loc = e.get("loc")
+        if e.get("type") == "missing" and (loc == ("query", "namespace") or loc == ["query", "namespace"]):
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "namespace query param is required, e.g. /v1/jobs/{id}?namespace=default"},
+            )
+    return JSONResponse(status_code=422, content={"detail": errors})
+
 app.include_router(v1_router, prefix="/v1")
 
 RECLAIM_INTERVAL_SEC = 30
