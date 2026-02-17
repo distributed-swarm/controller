@@ -9,6 +9,8 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from lifecycle.log import emit
+
 router = APIRouter()
 
 
@@ -57,119 +59,52 @@ def _publish_job_completed_event(
         {
             "job_id": job_id,
             "lease_id": lease_id,
+            "status": status_norm,
             "agent": agent,
-            "status": status_norm,  # external vocab: succeeded/failed
             "error": error,
-            "completed_at": _now_iso(),
+            "ts": _now_iso(),
         },
     )
 
 
-def _publish_job_result_rejected_event(
-    *,
-    job_id: str,
-    req: ResultRequest,
-    job: Optional[Dict[str, Any]],
-    reason: str,
-) -> None:
-    expected: Dict[str, Any] = {}
-    if isinstance(job, dict):
-        expected = {
-            "job_epoch": job.get("job_epoch"),
-            "lease_id": job.get("lease_id"),
-            "lease_expires_at": job.get("lease_expires_at"),
-        }
-
-    _try_publish_event(
-        "job.result.rejected",
-        {
-            "job_id": job_id,
-            "lease_id": req.lease_id,
-            "job_epoch_got": req.job_epoch,
-            "job_epoch_expected": expected.get("job_epoch") if expected else None,
-            "lease_id_expected": expected.get("lease_id") if expected else None,
-            "lease_expires_at": expected.get("lease_expires_at") if expected else None,
-            "reason": reason,  # STALE_EPOCH / STALE_LEASE
-            "alias": "STALE_LEASE" if reason == "STALE_EPOCH" else None,
-            "rejected_at": _now_iso(),
-        },
-    )
-
-
-def _publish_job_result_duplicate_event(
-    *,
-    job_id: str,
-    req: ResultRequest,
-    job: Optional[Dict[str, Any]],
-    status_norm: str,
-) -> None:
+def _publish_job_result_duplicate_event(*, job_id: str, req: ResultRequest, job: Optional[Dict[str, Any]]) -> None:
     _try_publish_event(
         "job.result.duplicate",
         {
             "job_id": job_id,
             "lease_id": req.lease_id,
             "job_epoch": req.job_epoch,
-            "status": status_norm,
-            "agent": _infer_agent_from_job(job),
-            "duplicate_at": _now_iso(),
+            "status": req.status,
+            "ts": _now_iso(),
         },
     )
 
 
-def _publish_job_result_accepted_event(
-    *,
-    job_id: str,
-    req: ResultRequest,
-    job: Optional[Dict[str, Any]],
-    status_norm: str,
-) -> None:
+def _publish_job_result_accepted_event(*, job_id: str, req: ResultRequest, job: Optional[Dict[str, Any]]) -> None:
     _try_publish_event(
         "job.result.accepted",
         {
             "job_id": job_id,
             "lease_id": req.lease_id,
             "job_epoch": req.job_epoch,
-            "status": status_norm,
-            "agent": _infer_agent_from_job(job),
-            "accepted_at": _now_iso(),
+            "status": req.status,
+            "ts": _now_iso(),
         },
     )
 
 
-def _force_transition_job(job: Dict[str, Any], *, internal_status: str, req: ResultRequest) -> None:
-    """
-    Force the job dict into a terminal state, using the controller's timestamp conventions.
-    """
-    now_ts = time.time()
-    now_iso = _now_iso()
-
-    job["status"] = internal_status
-
-    # Float timestamps
-    job["updated_ts"] = job.get("updated_ts") or now_ts
-    job["completed_ts"] = job.get("completed_ts") or now_ts
-
-    # ISO timestamps (legacy/back-compat)
-    job["updated_at"] = job.get("updated_at") or now_iso
-    job["completed_at"] = job.get("completed_at") or now_iso
-
-    # Track lease id defensively
-    job.setdefault("lease_id", req.lease_id)
-
-    if internal_status == "completed":
-        if req.result is not None:
-            job["result"] = req.result
-        job["error"] = None
-        job["state"] = job.get("state") or "succeeded"
-    else:
-        if req.error is not None:
-            job["error"] = req.error
-        job["state"] = job.get("state") or "failed"
-
-
-def _job_is_terminal(job: Dict[str, Any]) -> bool:
-    s = str(job.get("status", "")).strip().lower()
-    return s in ("completed", "failed", "succeeded")  # tolerate both vocabularies
+def _publish_job_result_rejected_event(*, job_id: str, req: ResultRequest, job: Optional[Dict[str, Any]], reason: str) -> None:
+    _try_publish_event(
+        "job.result.rejected",
+        {
+            "job_id": job_id,
+            "lease_id": req.lease_id,
+            "job_epoch": req.job_epoch,
+            "status": req.status,
+            "reason": reason,
+            "ts": _now_iso(),
+        },
+    )
 
 
 def _infer_agent_from_job(job: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -201,179 +136,132 @@ def _stale(code: str, *, job_id: str, req: ResultRequest, job: Optional[Dict[str
     """
     _publish_job_result_rejected_event(job_id=job_id, req=req, job=job, reason=code)
 
+    emit(
+        "JOB_RESULT_REJECTED",
+        job_id=job_id,
+        lease_id=req.lease_id,
+        job_epoch=req.job_epoch,
+        reason=code,
+        expected=(job.get("job_epoch") if isinstance(job, dict) else None),
+        expected_lease_id=(job.get("lease_id") if isinstance(job, dict) else None),
+        agent=_infer_agent_from_job(job),
+    )
+
     detail: Dict[str, Any] = {"error": code, "job_id": job_id}
 
     # Provide alias requested: STALE_EPOCH primary, STALE_LEASE alias.
     if code == "STALE_EPOCH":
         detail["alias"] = "STALE_LEASE"
+    elif code == "STALE_LEASE":
+        detail["alias"] = "STALE_EPOCH"
 
-    if job is not None:
-        detail["expected"] = {
-            "job_epoch": job.get("job_epoch"),
-            "lease_id": job.get("lease_id"),
-            "lease_expires_at": job.get("lease_expires_at"),
-        }
-    detail["got"] = {"job_epoch": req.job_epoch, "lease_id": req.lease_id}
     raise HTTPException(status_code=409, detail=detail)
 
 
-def _enforce_fencing(job: Dict[str, Any], req: ResultRequest, now_ts: float) -> None:
-    """
-    Enforce epoch + lease fencing rules on a job dict.
-    This is used for BOTH terminal and non-terminal jobs.
-    """
-    expected_epoch = job.get("job_epoch")
-    expected_lease = job.get("lease_id")
-
-    if expected_epoch is not None:
-        try:
-            exp_epoch_i = int(expected_epoch)
-            got_epoch_i = int(req.job_epoch)
-        except (TypeError, ValueError):
-            _stale("STALE_EPOCH", job_id=req.job_id, req=req, job=job)
-
-        if got_epoch_i != exp_epoch_i:
-            _stale("STALE_EPOCH", job_id=req.job_id, req=req, job=job)
-
-    if expected_lease is not None and str(req.lease_id) != str(expected_lease):
-        _stale("STALE_LEASE", job_id=req.job_id, req=req, job=job)
-
-    if _is_expired(job, now_ts):
-        _stale("STALE_LEASE", job_id=req.job_id, req=req, job=job)
-
-
 @router.post("/results", response_model=ResultResponse)
-async def post_result(req: ResultRequest) -> ResultResponse:
+def post_result(req: ResultRequest) -> ResultResponse:
     """
-    Report job completion.
+    Commit a job result. Uses epoch fencing to prevent zombies.
 
-    v1 contract:
-      status: succeeded|failed
-
-    Internal controller uses:
-      leased|completed|failed
-
-    This endpoint is intentionally idempotent:
-      - If the job is already terminal, accept ONLY if fencing tokens match.
-      - Otherwise enforce fencing, record result, and ensure job transitions terminal.
-
-    Ruthless additions:
-      - terminal idempotent success emits job.result.duplicate
-      - non-terminal success emits job.result.accepted (+ existing job.completed)
-      - any stale rejection emits job.result.rejected (inside _stale)
+    Rules:
+    - job_epoch must match current job_epoch stored on job
+    - lease_id must match current lease_id stored on job
     """
-    status_norm = (req.status or "").strip().lower()
-    if status_norm not in ("succeeded", "failed"):
-        raise HTTPException(status_code=422, detail="status must be 'succeeded' or 'failed'")
-
-    internal_status = "completed" if status_norm == "succeeded" else "failed"
-    now_ts = time.time()
+    job_id = str(req.job_id)
 
     try:
-        import app as app  # type: ignore
+        import app as app_mod  # type: ignore
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Runtime module 'app' not available: {e}")
 
-    jobs = getattr(app, "JOBS", None)
-    job: Optional[Dict[str, Any]] = None
+    state_lock = getattr(app_mod, "STATE_LOCK", None)
+    jobs = getattr(app_mod, "JOBS", None)
 
-    # If we can locate the job in memory, enforce fencing early.
-    if isinstance(jobs, dict):
-        maybe = jobs.get(req.job_id)
-        if isinstance(maybe, dict):
-            job = maybe
+    if state_lock is None or not isinstance(jobs, dict):
+        raise HTTPException(status_code=500, detail="Controller internals not available (STATE_LOCK/JOBS)")
 
-            # IMPORTANT: even if terminal, only accept idempotently if tokens match.
-            if _job_is_terminal(job):
-                _enforce_fencing(job, req, now_ts)
-                _publish_job_result_duplicate_event(job_id=req.job_id, req=req, job=job, status_norm=status_norm)
-                return ResultResponse(ok=True)
+    status_norm = str(req.status or "").strip().lower()
+    if status_norm not in ("succeeded", "failed"):
+        raise HTTPException(status_code=400, detail={"error": "BAD_STATUS", "status": req.status})
 
-            # Non-terminal: enforce fencing before recording.
-            _enforce_fencing(job, req, now_ts)
+    now_ts = time.time()
 
-    # Try calling an existing controller result function if one exists.
-    result_fn = None
-    for name in ("_post_result", "handle_result", "_handle_result"):
-        fn = getattr(app, name, None)
-        if callable(fn):
-            result_fn = fn
-            break
+    with state_lock:
+        job = jobs.get(job_id)
+        if not isinstance(job, dict):
+            raise HTTPException(status_code=404, detail={"error": "NOT_FOUND", "job_id": job_id})
 
-    if callable(result_fn):
-        # Attempt 1: keyword args
+        # Expired leases are always stale
+        if _is_expired(job, now_ts):
+            _stale("STALE_EPOCH", job_id=job_id, req=req, job=job)
+
+        # Epoch fence
+        expected_epoch = job.get("job_epoch")
         try:
-            r = result_fn(
+            expected_epoch_i = int(expected_epoch) if expected_epoch is not None else 1
+        except (TypeError, ValueError):
+            expected_epoch_i = 1
+        if int(req.job_epoch) != expected_epoch_i:
+            _stale("STALE_EPOCH", job_id=job_id, req=req, job=job)
+
+        # Lease fence
+        expected_lease_id = job.get("lease_id")
+        if expected_lease_id and str(req.lease_id) != str(expected_lease_id):
+            _stale("STALE_LEASE", job_id=job_id, req=req, job=job)
+
+        # If already terminal, idempotent accept if same lease+epoch, otherwise stale
+        state = str(job.get("state") or job.get("status") or "").lower()
+        if state in ("succeeded", "failed", "completed"):
+            _publish_job_result_duplicate_event(job_id=job_id, req=req, job=job)
+            emit(
+                "JOB_RESULT_DUPLICATE",
                 job_id=req.job_id,
-                status=internal_status,
-                result=req.result,
-                error=req.error,
                 lease_id=req.lease_id,
+                job_epoch=req.job_epoch,
+                status=status_norm,
+                agent=_infer_agent_from_job(job),
             )
-            if inspect.isawaitable(r):
-                await r
-        except TypeError:
-            # Attempt 2: pass the Pydantic object (legacy handler expects .json())
-            try:
-                req.status = internal_status
-                r = result_fn(req)
-                if inspect.isawaitable(r):
-                    await r
-            except TypeError:
-                # Attempt 3: positional fallback (job_id, status, result, error)
-                try:
-                    r = result_fn(req.job_id, internal_status, req.result, req.error)
-                    if inspect.isawaitable(r):
-                        await r
-                except Exception as e:
-                    raise HTTPException(status_code=500, detail=f"Failed to record result: {e}")
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Failed to record result: {e}")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to record result: {e}")
+            return ResultResponse(ok=True)
 
-        # Truthfulness: ensure the job actually transitioned. If not, force it.
-        if isinstance(jobs, dict):
-            maybe2 = jobs.get(req.job_id)
-            if isinstance(maybe2, dict) and not _job_is_terminal(maybe2):
-                _force_transition_job(maybe2, internal_status=internal_status, req=req)
-                job = maybe2
-            elif isinstance(maybe2, dict):
-                job = maybe2
+        # Commit
+        job["state"] = status_norm
+        job["status"] = "completed"
+        job["completed_ts"] = now_ts
+        job["completed_at"] = _now_iso()
 
-        # Non-terminal path success => accepted + completed
-        _publish_job_result_accepted_event(job_id=req.job_id, req=req, job=job, status_norm=status_norm)
+        if status_norm == "succeeded":
+            job["result"] = req.result
+            job["error"] = None
+        else:
+            job["result"] = None
+            job["error"] = req.error
+
+        agent = _infer_agent_from_job(job)
+
+        _publish_job_result_accepted_event(job_id=job_id, req=req, job=job)
+        emit(
+            "JOB_RESULT_ACCEPTED",
+            job_id=req.job_id,
+            lease_id=req.lease_id,
+            job_epoch=req.job_epoch,
+            status=status_norm,
+            agent=_infer_agent_from_job(job),
+        )
+
         _publish_job_completed_event(
             job_id=req.job_id,
             lease_id=req.lease_id,
             status_norm=status_norm,
-            agent=_infer_agent_from_job(job),
-            error=req.error if status_norm == "failed" else None,
+            agent=agent,
+            error=req.error,
         )
-        return ResultResponse(ok=True)
+        emit(
+            "JOB_COMPLETED",
+            job_id=req.job_id,
+            lease_id=req.lease_id,
+            job_epoch=req.job_epoch,
+            status=status_norm,
+            agent=agent,
+        )
 
-    # No controller function available => update in-memory JOBS directly.
-    if not isinstance(jobs, dict):
-        raise HTTPException(status_code=500, detail="Controller JOBS store not found; cannot record results")
-
-    job2 = jobs.get(req.job_id)
-    if not isinstance(job2, dict):
-        raise HTTPException(status_code=404, detail=f"Unknown job_id: {req.job_id}")
-
-    if _job_is_terminal(job2):
-        _enforce_fencing(job2, req, now_ts)
-        _publish_job_result_duplicate_event(job_id=req.job_id, req=req, job=job2, status_norm=status_norm)
-        return ResultResponse(ok=True)
-
-    _enforce_fencing(job2, req, now_ts)
-    _force_transition_job(job2, internal_status=internal_status, req=req)
-
-    _publish_job_result_accepted_event(job_id=req.job_id, req=req, job=job2, status_norm=status_norm)
-    _publish_job_completed_event(
-        job_id=req.job_id,
-        lease_id=req.lease_id,
-        status_norm=status_norm,
-        agent=_infer_agent_from_job(job2),
-        error=req.error if status_norm == "failed" else None,
-    )
     return ResultResponse(ok=True)
