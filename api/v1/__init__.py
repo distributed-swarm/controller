@@ -16,8 +16,8 @@ from .read import router as read_router  # noqa: E402
 from .events import router as events_router  # noqa: E402
 from .heartbeat import router as heartbeat_router  # noqa: E402
 
-from api.v1.audit import router as audit_router
-router.include_router(audit_router, prefix="/v1")
+from .audit import router as audit_router  # noqa: E402
+router.include_router(audit_router, tags=["v1/audit"])
 
 # Optional legacy/manual reclamation endpoint (safe to keep for now)
 try:
