@@ -14,7 +14,7 @@ from api.v1.events import publish_event
 from api.v1 import router as v1_router
 from lifecycle import start_reaper
 from api.v1 import AGENTS, JOBS, STATE_LOCK
-from logging_config import configure_logging
+from observability.logging_config import configure_logging
 configure_logging()
 import logging
 from starlette.middleware.base import BaseHTTPMiddleware
