@@ -16,6 +16,9 @@ from .read import router as read_router  # noqa: E402
 from .events import router as events_router  # noqa: E402
 from .heartbeat import router as heartbeat_router  # noqa: E402
 
+from api.v1.audit import router as audit_router
+router.include_router(audit_router, prefix="/v1")
+
 # Optional legacy/manual reclamation endpoint (safe to keep for now)
 try:
     from .reclamation.agents import router as reclamation_agents_router  # noqa: E402
