@@ -2,7 +2,44 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Tuple
+
+
+def _best_effort_compute_state(app_mod: Any, entry: Dict[str, Any], now: float) -> Tuple[str, str]:
+    """
+    Compute (state, reason) using controller's canonical logic if present.
+    Falls back safely if not available.
+    """
+    # Prefer the exact helper used elsewhere in app.py
+    fn = getattr(app_mod, "_compute_agent_state", None)
+    if callable(fn):
+        try:
+            state, reason = fn(entry, now)  # expected signature: (entry, now) -> (state, reason)
+            if isinstance(state, str) and isinstance(reason, str):
+                return state, reason
+        except TypeError:
+            # Signature mismatch; try alternate common shapes
+            try:
+                state, reason = fn(entry)  # (entry) -> (state, reason)
+                if isinstance(state, str) and isinstance(reason, str):
+                    return state, reason
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # Alternate name (just in case)
+    fn2 = getattr(app_mod, "compute_agent_state", None)
+    if callable(fn2):
+        try:
+            state, reason = fn2(entry, now)
+            if isinstance(state, str) and isinstance(reason, str):
+                return state, reason
+        except Exception:
+            pass
+
+    # Safe fallback
+    return "healthy", "no_state_fn"
 
 
 def upsert_agent(
@@ -11,12 +48,14 @@ def upsert_agent(
     capabilities: Dict[str, Any] | None = None,
     worker_profile: Dict[str, Any] | None = None,
     metrics: Dict[str, Any] | None = None,
-) -> None:
+) -> Tuple[str, str]:
     """
     Canonical v1 helper that keeps the in-memory AGENTS store fresh.
 
     Writes to app.AGENTS (the same store legacy endpoints use),
     so scheduling/gating has one source of truth.
+
+    Returns (state, reason) computed via the controller's canonical state logic.
     """
     import app  # type: ignore
 
@@ -29,7 +68,7 @@ def upsert_agent(
     agents = getattr(app, "AGENTS", None)
     if agents is None or not isinstance(agents, dict):
         # If app.AGENTS ever disappears, don't crash leasing paths.
-        return
+        return "unknown", "agents_store_missing"
 
     entry = agents.get(name) or {}
     if not isinstance(entry, dict):
@@ -59,7 +98,13 @@ def upsert_agent(
     # Liveness marker.
     entry["last_seen"] = now
 
+    # Compute and store health state (best-effort, canonical if present).
+    state, reason = _best_effort_compute_state(app, entry, now)
+    entry["state"] = state
+    entry["state_reason"] = reason
+
     agents[name] = entry
+    return state, reason
 
 
 def tombstone_agent(
@@ -92,7 +137,10 @@ def tombstone_agent(
     entry["tombstone_reason"] = reason
 
     agents[name] = entry
-    _emit_agent_event("agent_tombstoned", {"name": name, "tombstoned_at": entry.get("tombstoned_at"), "reason": reason})
+    _emit_agent_event(
+        "agent_tombstoned",
+        {"name": name, "tombstoned_at": entry.get("tombstoned_at"), "reason": reason},
+    )
     return True
 
 
