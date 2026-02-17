@@ -18,29 +18,23 @@ router = APIRouter()
 # ----------------------------
 # Kernel-ish invariants
 # ----------------------------
-# Bounded memory: never unbounded growth.
-_AUDIT_MAX = 2000
-_MAX_AGENT_STATE = 5000  # guardrail for agent tracking maps
+_AUDIT_MAX = 2000                # bounded event buffer
+_MAX_AGENT_STATE = 5000          # bounded agent maps
 
-# Process identity (helps detect multi-worker split-brain).
 _BOOT_ID = str(uuid.uuid4())
 _PID = os.getpid()
 _PROCESS_START_TS = time.time()
 
 _EVENTS: Deque["AuditEvent"] = deque(maxlen=_AUDIT_MAX)
-
-# Simple counters without requiring Prometheus wiring.
 COUNTERS: Counter = Counter()
 
-# Last-seen capability fingerprint per agent (within this process).
+# Per-agent kernel state (per process)
 _LAST_NORM_HASH: Dict[str, str] = {}
 _LAST_SEEN_TS: Dict[str, float] = {}
-
-# Track which PID last produced an event for an agent (helps detect multi-process behavior).
 _LAST_AGENT_PID: Dict[str, int] = {}
 
-# Optional: per-(pid,agent) hash so we can reason about local change detection fidelity.
-_LAST_NORM_HASH_BY_PID_AGENT: Dict[Tuple[int, str], str] = {}
+# guard against recursion when we append derived events (capability.changed/proc_switch)
+_APPENDING_DERIVED = False
 
 
 @dataclass(frozen=True)
@@ -115,156 +109,157 @@ def _prune_agent_state_if_needed() -> None:
         _LAST_SEEN_TS.pop(agent, None)
         _LAST_NORM_HASH.pop(agent, None)
         _LAST_AGENT_PID.pop(agent, None)
-        _LAST_NORM_HASH_BY_PID_AGENT.pop((_PID, agent), None)
 
 
-def _append_event(ev: AuditEvent) -> None:
-    _EVENTS.append(ev)
-    emit("CAPABILITY_AUDIT", **asdict(ev))
-
-
-def _record_proc_switch(
-    *,
-    endpoint: str,
-    agent: str,
-    namespace: Optional[str],
-    shape: str,
-    prev_pid: int,
-    norm_hash: str,
-    ops_count_normalized: int,
-) -> None:
-    """
-    Same agent is being handled by different PIDs.
-    This is the canonical symptom of multi-worker split-brain for in-memory auditing.
-    """
+def _emit_proc_switch(ev: AuditEvent, prev_pid: int) -> None:
     now = _now()
-    _inc("capability.proc_switch", endpoint, shape, None)
+    _inc("capability.proc_switch", ev.endpoint, ev.shape, None)
 
-    _append_event(
-        AuditEvent(
-            ts=now,
-            ts_ms=int(now * 1000),
-            event_id=str(uuid.uuid4()),
-            boot_id=_BOOT_ID,
-            pid=_PID,
-            event="capability.proc_switch",
-            endpoint=endpoint,
-            agent=agent,
-            namespace=namespace,
-            shape=shape,
-            reason_code=None,
-            warning_codes=["MULTI_PROCESS_OBSERVED"],
-            ops_count_received=None,
-            ops_count_normalized=int(ops_count_normalized),
-            raw_hash="",
-            norm_hash=norm_hash,
-            request_id=None,
-            prev_norm_hash=None,
-            prev_pid=int(prev_pid),
-        )
+    derived = AuditEvent(
+        ts=now,
+        ts_ms=int(now * 1000),
+        event_id=str(uuid.uuid4()),
+        boot_id=_BOOT_ID,
+        pid=_PID,
+        event="capability.proc_switch",
+        endpoint=ev.endpoint,
+        agent=ev.agent,
+        namespace=ev.namespace,
+        shape=ev.shape,
+        reason_code=None,
+        warning_codes=["MULTI_PROCESS_OBSERVED"],
+        ops_count_received=None,
+        ops_count_normalized=int(ev.ops_count_normalized),
+        raw_hash="",
+        norm_hash=ev.norm_hash,
+        request_id=ev.request_id,
+        prev_norm_hash=None,
+        prev_pid=int(prev_pid),
     )
 
     emit(
         "CAPABILITY_PROC_SWITCH",
-        endpoint=endpoint,
-        agent=agent,
-        namespace=namespace,
+        endpoint=ev.endpoint,
+        agent=ev.agent,
+        namespace=ev.namespace,
         prev_pid=int(prev_pid),
         pid=_PID,
         boot_id=_BOOT_ID,
-        norm_hash=norm_hash,
-        ops_count_normalized=int(ops_count_normalized),
+        norm_hash=ev.norm_hash,
+        ops_count_normalized=int(ev.ops_count_normalized),
         ts=now,
     )
 
+    _append_event(derived)
 
-def _maybe_record_change(
-    *,
-    endpoint: str,
-    agent: str,
-    namespace: Optional[str],
-    shape: str,
-    norm_hash: str,
-    ops_count_normalized: int,
-) -> None:
-    """
-    Emit capability.changed when an agent's capability fingerprint changes.
-    Kernel principle: no silent drift (but must detect multi-worker split-brain).
-    """
+
+def _emit_changed(ev: AuditEvent, prev_norm_hash: str) -> None:
     now = _now()
-
-    # Update liveness and bounded state
-    _LAST_SEEN_TS[agent] = now
-    _prune_agent_state_if_needed()
-
-    # Detect PID switching for the same agent (multi-worker symptom)
-    prev_pid = _LAST_AGENT_PID.get(agent)
-    if prev_pid is not None and prev_pid != _PID:
-        _record_proc_switch(
-            endpoint=endpoint,
-            agent=agent,
-            namespace=namespace,
-            shape=shape,
-            prev_pid=prev_pid,
-            norm_hash=norm_hash,
-            ops_count_normalized=ops_count_normalized,
-        )
-    _LAST_AGENT_PID[agent] = _PID
-
-    # Per-process last hash (this is the only "truth" we can maintain without shared storage)
-    prev = _LAST_NORM_HASH.get(agent)
-
-    # Also maintain per-(pid,agent) fingerprint
-    _LAST_NORM_HASH_BY_PID_AGENT[(_PID, agent)] = norm_hash
-
-    if prev is None:
-        # First time seeing this agent in this process; establish baseline.
-        _LAST_NORM_HASH[agent] = norm_hash
-        return
-
-    if prev == norm_hash:
-        return
-
-    # It changed within this process: emit changed.
-    _LAST_NORM_HASH[agent] = norm_hash
-    _inc("capability.changed", endpoint, shape, None)
+    _inc("capability.changed", ev.endpoint, ev.shape, None)
 
     emit(
         "CAPABILITY_CHANGED",
-        endpoint=endpoint,
-        agent=agent,
-        namespace=namespace,
-        prev_norm_hash=prev,
-        norm_hash=norm_hash,
-        ops_count_normalized=int(ops_count_normalized),
+        endpoint=ev.endpoint,
+        agent=ev.agent,
+        namespace=ev.namespace,
+        prev_norm_hash=prev_norm_hash,
+        norm_hash=ev.norm_hash,
+        ops_count_normalized=int(ev.ops_count_normalized),
         ts=now,
         pid=_PID,
         boot_id=_BOOT_ID,
     )
 
-    _append_event(
-        AuditEvent(
-            ts=now,
-            ts_ms=int(now * 1000),
-            event_id=str(uuid.uuid4()),
-            boot_id=_BOOT_ID,
-            pid=_PID,
-            event="capability.changed",
-            endpoint=endpoint,
-            agent=agent,
-            namespace=namespace,
-            shape=shape,
-            reason_code=None,
-            warning_codes=[],
-            ops_count_received=None,
-            ops_count_normalized=int(ops_count_normalized),
-            raw_hash="",
-            norm_hash=norm_hash,
-            request_id=None,
-            prev_norm_hash=prev,
-            prev_pid=None,
-        )
+    derived = AuditEvent(
+        ts=now,
+        ts_ms=int(now * 1000),
+        event_id=str(uuid.uuid4()),
+        boot_id=_BOOT_ID,
+        pid=_PID,
+        event="capability.changed",
+        endpoint=ev.endpoint,
+        agent=ev.agent,
+        namespace=ev.namespace,
+        shape=ev.shape,
+        reason_code=None,
+        warning_codes=[],
+        ops_count_received=None,
+        ops_count_normalized=int(ev.ops_count_normalized),
+        raw_hash="",
+        norm_hash=ev.norm_hash,
+        request_id=ev.request_id,
+        prev_norm_hash=prev_norm_hash,
+        prev_pid=None,
     )
+
+    _append_event(derived)
+
+
+def _kernel_enforce_change_detection(ev: AuditEvent) -> None:
+    """
+    Kernel chokepoint enforcement:
+    - for accept/coerce, update baseline and emit capability.changed if fingerprint changes
+    - also detect same-agent PID switching (multi-worker symptom)
+    """
+    # Only apply to primary events, never derived ones.
+    if ev.event not in ("capability.accept", "capability.coerce"):
+        return
+
+    agent = ev.agent
+    now = _now()
+
+    _LAST_SEEN_TS[agent] = now
+    _prune_agent_state_if_needed()
+
+    # Detect PID switch for same agent (should not happen in single-process mode).
+    prev_pid = _LAST_AGENT_PID.get(agent)
+    if prev_pid is not None and prev_pid != _PID:
+        _emit_proc_switch(ev, prev_pid)
+    _LAST_AGENT_PID[agent] = _PID
+
+    prev = _LAST_NORM_HASH.get(agent)
+    if prev is None:
+        # baseline
+        _LAST_NORM_HASH[agent] = ev.norm_hash
+        return
+
+    if prev == ev.norm_hash:
+        return
+
+    # changed
+    _LAST_NORM_HASH[agent] = ev.norm_hash
+    _emit_changed(ev, prev)
+
+
+def _append_event(ev: AuditEvent) -> None:
+    """
+    Single chokepoint:
+    - appends event
+    - emits logs
+    - enforces change detection for accept/coerce (kernel invariant)
+    """
+    global _APPENDING_DERIVED
+
+    # Always count the primary event.
+    _inc(ev.event, ev.endpoint, ev.shape, ev.reason_code)
+
+    _EVENTS.append(ev)
+    emit("CAPABILITY_AUDIT", **asdict(ev))
+
+    # Prevent recursion when we append derived events.
+    if _APPENDING_DERIVED:
+        return
+
+    # Derived events should not trigger more derived events.
+    if ev.event in ("capability.changed", "capability.proc_switch"):
+        return
+
+    # Kernel enforcement runs here, not in callers.
+    _APPENDING_DERIVED = True
+    try:
+        _kernel_enforce_change_detection(ev)
+    finally:
+        _APPENDING_DERIVED = False
 
 
 def record_capability_event(
@@ -281,15 +276,13 @@ def record_capability_event(
     request_id: Optional[str] = None,
     raw_payload: Any = None,
 ) -> None:
+    """
+    Public API used by lease boundary:
+    record a capability event. Change detection is enforced at the append chokepoint.
+    """
     warning_codes = warning_codes or []
     now = _now()
     norm_hash = _ops_fingerprint(ops_normalized)
-
-    # Bounded state updates (kernel rule)
-    _LAST_SEEN_TS[str(agent)] = now
-    _prune_agent_state_if_needed()
-
-    _inc(event, endpoint, shape, reason_code)
 
     ev = AuditEvent(
         ts=now,
@@ -297,8 +290,8 @@ def record_capability_event(
         event_id=str(uuid.uuid4()),
         boot_id=_BOOT_ID,
         pid=_PID,
-        event=event,
-        endpoint=endpoint,
+        event=str(event),
+        endpoint=str(endpoint),
         agent=str(agent),
         namespace=str(namespace) if namespace is not None else None,
         shape=str(shape),
@@ -312,18 +305,8 @@ def record_capability_event(
         prev_norm_hash=None,
         prev_pid=None,
     )
-    _append_event(ev)
 
-    # Change detection: meaningful only on accept/coerce (not reject).
-    if event in ("capability.accept", "capability.coerce"):
-        _maybe_record_change(
-            endpoint=endpoint,
-            agent=str(agent),
-            namespace=str(namespace) if namespace is not None else None,
-            shape=str(shape),
-            norm_hash=norm_hash,
-            ops_count_normalized=len(ops_normalized),
-        )
+    _append_event(ev)
 
 
 @router.get("/audit/capabilities")
@@ -343,7 +326,6 @@ def get_capability_audit(
 
     rows = rows[-limit:]
 
-    # Runtime diagnostics: makes multi-process behavior obvious without needing `ps`.
     distinct_pids = sorted({r.pid for r in _EVENTS})
     proc_uptime_s = max(0.0, _now() - _PROCESS_START_TS)
 
