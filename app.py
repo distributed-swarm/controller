@@ -18,6 +18,7 @@ from observability.logging_config import configure_logging
 configure_logging()
 import logging
 from starlette.middleware.base import BaseHTTPMiddleware
+from lifecycle.lifecycle_log import lifecycle
 
 from pipelines.engine import run_text_pipeline
 from pipelines.spec import IntakeRequest
