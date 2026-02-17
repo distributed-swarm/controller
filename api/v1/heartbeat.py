@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter
 from pydantic import BaseModel
+from lifecycle.lifecycle_log import lifecycle
 
 from api.v1.agents import upsert_agent
 
@@ -40,4 +41,11 @@ def heartbeat(req: HeartbeatRequest) -> Dict[str, Any]:
         worker_profile=req.worker_profile,
         metrics=req.metrics,
     )
+    
+    lifecycle(
+        "agent_seen",
+        agent=req.name,
+        namespace=(req.labels or {}).get("namespace", "default"),
+    )
+    
     return {"ok": True}
