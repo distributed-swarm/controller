@@ -111,11 +111,15 @@ def tombstone_agent(
     name: str,
     tombstoned_at: float | None = None,
     reason: str = "stale_heartbeat",
+    emit_type: str = "agent_tombstoned",
 ) -> bool:
     """
     Marks an agent as tombstoned in app.AGENTS.
     Idempotent: calling multiple times is fine.
     Returns True if the agent existed and is now tombstoned (or already was).
+
+    emit_type allows API delete instrumentation to emit AGENT_TOMBSTONED_BY_API
+    without changing reaper behavior.
     """
     import app  # type: ignore
 
@@ -138,7 +142,7 @@ def tombstone_agent(
 
     agents[name] = entry
     _emit_agent_event(
-        "agent_tombstoned",
+        emit_type,
         {"name": name, "tombstoned_at": entry.get("tombstoned_at"), "reason": reason},
     )
     return True
@@ -149,10 +153,12 @@ def delete_agent(
     deleted_at: float | None = None,
     emit_type: str = "agent_deleted",
 ) -> bool:
-
     """
     Hard-deletes an agent from app.AGENTS.
     Returns True if the agent existed and was removed.
+
+    emit_type allows API delete instrumentation to emit AGENT_DELETED_BY_API
+    without changing reaper behavior.
     """
     import app  # type: ignore
 
