@@ -9,6 +9,8 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+from lifecycle.log import emit
+
 router = APIRouter()
 
 
@@ -69,48 +71,57 @@ def _coerce_positive_float(v: Any) -> Optional[float]:
 
 def _effective_ttl_seconds(*, job: Dict[str, Any], req_ttl_s: int) -> float:
     policy = _coerce_positive_float(job.get("lease_timeout_s"))
-    req_ttl = float(req_ttl_s)
-    ttl = min(policy, req_ttl) if policy is not None else req_ttl
-    ttl = max(5.0, min(ttl, 3600.0))
-    return ttl
+    if policy is None:
+        return float(req_ttl_s)
+    return max(5.0, min(float(policy), 120.0))
 
 
-def _extract_job_id(job_like: Dict[str, Any]) -> Optional[str]:
-    v = job_like.get("job_id") or job_like.get("id") or job_like.get("jobId")
-    return str(v) if v else None
+def _extract_job_id(leased_preview: Any) -> Optional[str]:
+    if leased_preview is None:
+        return None
+    if isinstance(leased_preview, str):
+        return leased_preview
+    if isinstance(leased_preview, dict):
+        for k in ("job_id", "id"):
+            v = leased_preview.get(k)
+            if v:
+                return str(v)
+    return None
 
 
-def _job_allows_agent(job: Dict[str, Any], agent_name: str) -> bool:
-    pinned = job.get("pinned_agent") or job.get("pinnedAgent")
-    return (not pinned) or (str(pinned) == str(agent_name))
+def _job_allows_agent(job: Dict[str, Any], agent: str) -> bool:
+    pinned = job.get("pinned_agent")
+    if not pinned:
+        return True
+    return str(pinned) == str(agent)
 
 
 def _normalize_task_from_job(job: Dict[str, Any]) -> LeaseTask:
-    job_id = _extract_job_id(job)
-    op = job.get("op") or job.get("type") or job.get("job_type") or job.get("jobType")
-    if not job_id or not op:
-        raise HTTPException(status_code=500, detail=f"Invalid job shape for lease: {job}")
-
-    payload = job.get("payload") if job.get("payload") is not None else {}
-    pinned = job.get("pinned_agent") or job.get("pinnedAgent")
-
-    try:
-        epoch = int(job.get("job_epoch") or 1)
-    except (TypeError, ValueError):
-        epoch = 1
-
     return LeaseTask(
-        job_id=str(job_id),
-        job_epoch=epoch,
-        op=str(op),
-        payload=payload,
-        pinned_agent=str(pinned) if pinned is not None else None,
+        job_id=str(job.get("id") or job.get("job_id") or ""),
+        job_epoch=int(job.get("job_epoch") or 1),
+        op=str(job.get("op") or ""),
+        payload=job.get("payload") or {},
+        pinned_agent=str(job.get("pinned_agent")) if job.get("pinned_agent") else None,
     )
 
 
-def _publish_event_best_effort(event: str, data: Dict[str, Any]) -> None:
+def _requeue_job(task_queues: Dict[str, Any], job_id: str, job: Dict[str, Any]) -> None:
+    # Best-effort: put job back in its queue based on excitatory_level / priority.
+    lvl = job.get("excitatory_level")
     try:
-        from api.v1.events import publish_event  # deferred import
+        lvl_i = int(lvl) if lvl is not None else 1
+    except (TypeError, ValueError):
+        lvl_i = 1
+    lvl_i = max(0, min(3, lvl_i))
+    q = task_queues.get(str(lvl_i))
+    if isinstance(q, list):
+        q.append(job_id)
+
+
+def _try_publish_event(event: str, data: Dict[str, Any]) -> None:
+    try:
+        from api.v1.events import publish_event  # deferred to avoid circular imports
     except Exception:
         return
     try:
@@ -120,114 +131,87 @@ def _publish_event_best_effort(event: str, data: Dict[str, Any]) -> None:
 
 
 def _publish_job_leased_event(*, namespace: str, job_id: str, lease_id: str, agent: str, job_epoch: int) -> None:
-    _publish_event_best_effort(
+    _try_publish_event(
         "job.leased",
-        {"namespace": namespace, "job_id": job_id, "lease_id": lease_id, "agent": agent, "job_epoch": job_epoch, "ts": _now_ts()},
+        {
+            "namespace": namespace,
+            "job_id": job_id,
+            "lease_id": lease_id,
+            "agent": agent,
+            "job_epoch": job_epoch,
+        },
     )
 
 
 def _publish_job_expired_event(*, namespace: str, job_id: str, lease_id: Optional[str], job_epoch: int, reason: str) -> None:
-    _publish_event_best_effort(
+    _try_publish_event(
         "job.expired",
-        {"namespace": namespace, "job_id": job_id, "lease_id": lease_id, "job_epoch": job_epoch, "reason": reason, "ts": _now_ts()},
+        {
+            "namespace": namespace,
+            "job_id": job_id,
+            "lease_id": lease_id,
+            "job_epoch": job_epoch,
+            "reason": reason,
+        },
     )
 
 
 def _upsert_agent_from_lease(req: LeaseRequest) -> None:
+    """
+    Keep agent registry warm from lease requests (v1-only systems may not send heartbeats).
+    """
     try:
-        from api.v1.agents import upsert_agent  # type: ignore
+        import api.v1.agents as agents_mod  # type: ignore
     except Exception:
         return
 
-    # Try to read existing agent record to prevent namespace flip-flopping
-    existing_ns: Optional[str] = None
-    try:
-        from api.v1.agents import get_agent  # type: ignore
-        existing = get_agent(req.agent)  # expected to return dict-like or None
-        if isinstance(existing, dict):
-            labels = existing.get("labels") or {}
-            if isinstance(labels, dict):
-                existing_ns = labels.get("namespace")
-    except Exception:
-        existing_ns = None
-
-    # If agent exists, namespace must be stable
-    if existing_ns and str(existing_ns) != str(req.namespace):
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "AGENT_NAMESPACE_MISMATCH",
-                "agent": req.agent,
-                "agent_namespace": existing_ns,
-                "requested_namespace": req.namespace,
-            },
-        )
+    upsert = getattr(agents_mod, "upsert_agent", None) or getattr(agents_mod, "_upsert_agent", None)
+    if not callable(upsert):
+        return
 
     caps = req.capabilities
-    if isinstance(caps, dict):
-        caps = caps.get("ops") or []
-    if caps is None:
-        caps = []
-    if not isinstance(caps, list):
-        caps = [caps]
-    ops = [str(x) for x in caps if x is not None]
+    ops: List[str] = []
+    if isinstance(caps, list):
+        ops = [str(x) for x in caps if x is not None]
+    elif isinstance(caps, dict):
+        v = caps.get("ops")
+        if isinstance(v, list):
+            ops = [str(x) for x in v if x is not None]
 
     try:
-        upsert_agent(
-            name=req.agent,
+        upsert(
+            req.agent,
             labels={"namespace": req.namespace},
             capabilities={"ops": ops},
-            worker_profile={},
-            metrics={},
         )
     except Exception:
         return
 
 
-def _requeue_job(task_queues: Dict[int, Any], job_id: str, job: Dict[str, Any]) -> None:
-    try:
-        lvl = int(job.get("excitatory_level", 1) or 1)
-    except (TypeError, ValueError):
-        lvl = 1
-    lvl = max(0, min(3, lvl))
-    try:
-        task_queues[lvl].append(job_id)
-    except Exception:
-        pass
-
-
-def _expire_leases_and_bump_epochs(app_mod: Any, now: float) -> None:
+def _expire_leases_and_bump_epochs(app_mod: Any, now_ts: float) -> None:
     jobs = getattr(app_mod, "JOBS", None)
     task_queues = getattr(app_mod, "TASK_QUEUES", None)
+
     if not isinstance(jobs, dict) or not isinstance(task_queues, dict):
         return
 
     for job_id, job in list(jobs.items()):
         if not isinstance(job, dict):
             continue
-        if job.get("status") != "leased":
-            continue
-
         exp = job.get("lease_expires_at")
         if exp is None:
-            leased_ts = job.get("leased_ts")
-            timeout_s = _coerce_positive_float(job.get("lease_timeout_s"))
-            if leased_ts is None or timeout_s is None:
-                continue
-            try:
-                exp = float(leased_ts) + float(timeout_s)
-            except (TypeError, ValueError):
-                continue
-
+            continue
         try:
             exp_f = float(exp)
         except (TypeError, ValueError):
             continue
-
-        if now <= exp_f:
+        if now_ts <= exp_f:
             continue
 
+        # Expired: bump epoch, clear lease, requeue
         prev_lease_id = job.get("lease_id")
+        ns = job.get("namespace") or job.get("labels", {}).get("namespace") or "default"
+
         try:
             job["job_epoch"] = int(job.get("job_epoch") or 1) + 1
         except (TypeError, ValueError):
@@ -241,9 +225,17 @@ def _expire_leases_and_bump_epochs(app_mod: Any, now: float) -> None:
 
         _requeue_job(task_queues, str(job_id), job)
 
-        ns = str(job.get("namespace") or "")
+        emit(
+            "JOB_EXPIRED",
+            namespace=str(ns),
+            job_id=str(job_id),
+            lease_id=str(prev_lease_id) if prev_lease_id else None,
+            job_epoch=int(job["job_epoch"]),
+            reason="ttl",
+        )
+
         _publish_job_expired_event(
-            namespace=ns,
+            namespace=str(ns),
             job_id=str(job_id),
             lease_id=str(prev_lease_id) if prev_lease_id else None,
             job_epoch=int(job["job_epoch"]),
@@ -251,13 +243,14 @@ def _expire_leases_and_bump_epochs(app_mod: Any, now: float) -> None:
         )
 
 
-def _stamp_authoritative_lease(job: Dict[str, Any], *, lease_id: str, now: float, req_ttl_s: int) -> int:
+def _stamp_authoritative_lease(*, job: Dict[str, Any], lease_id: str, now: float, req_ttl_s: int) -> int:
+    # Ensure epoch exists
     try:
         epoch = int(job.get("job_epoch") or 1)
     except (TypeError, ValueError):
         epoch = 1
-
     job["job_epoch"] = epoch
+
     job["lease_id"] = lease_id
     job["leased_ts"] = now
 
@@ -272,17 +265,14 @@ def _stamp_authoritative_lease(job: Dict[str, Any], *, lease_id: str, now: float
 def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
     ns = (req.namespace or "").strip()
     if not ns:
+        emit("LEASE_REJECTED", namespace=ns, agent=req.agent, reason="missing_namespace")
         raise HTTPException(status_code=400, detail="namespace is required")
 
     # --- Namespace fence: stored agent namespace is authoritative ---
-    # The agent registry is namespace-scoped, so get_agent(req.agent) may not find an
-    # agent that exists under a *different* namespace. We must scan for the agent name
-    # across namespaces and prevent cross-namespace leasing.
     existing_ns: Optional[str] = None
     try:
         import api.v1.agents as agents_mod  # type: ignore
 
-        # Try any exported helper first (may or may not be namespace-aware)
         getter = getattr(agents_mod, "get_agent", None)
         if callable(getter):
             existing = getter(req.agent)
@@ -291,7 +281,6 @@ def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
                 if isinstance(labels, dict):
                     existing_ns = labels.get("namespace")
 
-        # Authoritative scan across namespaces (AGENTS is the in-memory store)
         store = getattr(agents_mod, "AGENTS", None) or getattr(agents_mod, "_AGENTS", None)
         if isinstance(store, dict):
             for ns_key, by_name in store.items():
@@ -303,6 +292,14 @@ def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
 
     if existing_ns:
         if str(existing_ns) != str(ns):
+            emit(
+                "LEASE_REJECTED",
+                namespace=ns,
+                agent=req.agent,
+                reason="AGENT_NAMESPACE_MISMATCH",
+                agent_namespace=existing_ns,
+                requested_namespace=ns,
+            )
             raise HTTPException(
                 status_code=409,
                 detail={
@@ -315,9 +312,7 @@ def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
         ns = str(existing_ns)
     # ---------------------------------------------------------------
 
-
     _upsert_agent_from_lease(req)
-
 
     try:
         import app as app_mod  # type: ignore
@@ -337,9 +332,6 @@ def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
     tasks: List[LeaseTask] = []
 
     def _call_lease_next():
-        # Support both signatures:
-        #   _lease_next_job(agent)
-        #   _lease_next_job(agent, namespace)
         try:
             return lease_next(req.agent, ns)
         except TypeError:
@@ -347,9 +339,8 @@ def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
 
     def try_lease_batch_once() -> None:
         nonlocal tasks
-        now = _now_ts()
 
-        _expire_leases_and_bump_epochs(app_mod, now)
+        _expire_leases_and_bump_epochs(app_mod, _now_ts())
 
         while len(tasks) < req.max_tasks:
             leased_preview = _call_lease_next()
@@ -374,6 +365,16 @@ def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
             epoch = _stamp_authoritative_lease(stored, lease_id=lease_id, now=_now_ts(), req_ttl_s=req_ttl_s)
             tasks.append(_normalize_task_from_job(stored))
 
+            emit(
+                "JOB_LEASED",
+                namespace=ns,
+                job_id=str(job_id),
+                lease_id=lease_id,
+                leased_by=req.agent,
+                job_epoch=epoch,
+                op=str(stored.get("op") or ""),
+            )
+
             _publish_job_leased_event(
                 namespace=ns,
                 job_id=str(job_id),
@@ -388,6 +389,7 @@ def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
         with state_lock:
             try_lease_batch_once()
         if not tasks:
+            emit("LEASE_EMPTY", namespace=ns, agent=req.agent, max_tasks=req.max_tasks)
             return Response(status_code=204)
         return LeaseResponse(lease_id=lease_id, tasks=tasks)
 
@@ -399,6 +401,7 @@ def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
                 return LeaseResponse(lease_id=lease_id, tasks=tasks)
 
         if _now_ts() >= deadline:
+            emit("LEASE_EMPTY", namespace=ns, agent=req.agent, max_tasks=req.max_tasks)
             return Response(status_code=204)
 
         time.sleep(0.1)
@@ -408,6 +411,7 @@ def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
 def force_expire(req: ForceExpireRequest) -> Dict[str, Any]:
     ns = (req.namespace or "").strip()
     if not ns:
+        emit("LEASE_EXPIRE_REJECTED", namespace=ns, job_id=req.job_id, reason="missing_namespace")
         raise HTTPException(status_code=400, detail="namespace is required")
 
     try:
@@ -443,6 +447,15 @@ def force_expire(req: ForceExpireRequest) -> Dict[str, Any]:
         job["status"] = "queued"
 
         _requeue_job(task_queues, req.job_id, job)
+
+        emit(
+            "JOB_EXPIRED",
+            namespace=ns,
+            job_id=req.job_id,
+            lease_id=str(prev_lease_id) if prev_lease_id else None,
+            job_epoch=int(job["job_epoch"]),
+            reason=req.reason,
+        )
 
         _publish_job_expired_event(
             namespace=ns,
