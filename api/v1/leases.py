@@ -21,7 +21,7 @@ class LeaseRequest(BaseModel):
     namespace: str = Field(..., min_length=1, description="Tenant/namespace (required).")
 
     # Accept both legacy list[str] and dict {"ops":[...]} (agents may send either)
-    capabilities: Optional[Union[List[str], Dict[str, Any]]] = Field(
+    capabilities: Any = Field(
         default=None,
         description="Agent capabilities. Accepts list[str] or dict containing ops.",
     )
