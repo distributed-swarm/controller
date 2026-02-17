@@ -271,10 +271,16 @@ def _publish_job_expired_event(*, namespace: str, job_id: str, lease_id: Optiona
     )
 
 
-def _upsert_agent_from_lease(req: LeaseRequest, ops_norm: List[str]) -> None:
+def _upsert_agent_from_lease(req: LeaseRequest, ops_norm: List[str], raw_caps: Any) -> None:
     """
     Keep agent registry warm from lease requests (v1-only systems may not send heartbeats).
-    NOTE: uses *normalized* ops only. No ad-hoc parsing allowed here.
+
+    CLEAN RULE:
+      - leases.py owns input validation + audit boundary
+      - agents.upsert_agent owns canonical state mutation + diff + capability.changed emission
+
+    So we pass raw_caps through to upsert_agent (single choke point),
+    but still include namespace label fencing.
     """
     try:
         import api.v1.agents as agents_mod  # type: ignore
@@ -286,10 +292,12 @@ def _upsert_agent_from_lease(req: LeaseRequest, ops_norm: List[str]) -> None:
         return
 
     try:
+        # Pass raw caps so upsert_agent performs canonical coercion/diff/event.
+        # Do NOT pass ops_norm into capabilities here — that would duplicate coercion logic.
         upsert(
             req.agent,
             labels={"namespace": req.namespace},
-            capabilities={"ops": ops_norm},
+            capabilities=raw_caps,
         )
     except Exception:
         return
