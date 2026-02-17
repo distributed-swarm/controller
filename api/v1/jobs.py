@@ -1,10 +1,12 @@
 # controller/api/v1/jobs.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
+
+from lifecycle.log import emit
 
 router = APIRouter()
 
@@ -45,6 +47,7 @@ def create_job(req: CreateJobRequest) -> CreateJobResponse:
     """
     ns = (req.namespace or "").strip()
     if not ns:
+        emit("JOB_REJECTED", namespace=ns, reason="missing_namespace", op=req.op)
         raise HTTPException(status_code=400, detail="namespace is required")
 
     try:
@@ -83,6 +86,13 @@ def create_job(req: CreateJobRequest) -> CreateJobResponse:
         if pinned:
             try:
                 if not bool(is_avail(pinned)):
+                    emit(
+                        "JOB_REJECTED",
+                        namespace=ns,
+                        reason="requested_agent_unavailable",
+                        pinned_agent=pinned,
+                        op=req.op,
+                    )
                     raise HTTPException(
                         status_code=409,
                         detail={"error": "requested_agent_unavailable", "agent": pinned},
@@ -91,6 +101,13 @@ def create_job(req: CreateJobRequest) -> CreateJobResponse:
                 raise
             except Exception:
                 # If the health subsystem is broken, be conservative and reject pinning
+                emit(
+                    "JOB_REJECTED",
+                    namespace=ns,
+                    reason="requested_agent_unavailable",
+                    pinned_agent=pinned,
+                    op=req.op,
+                )
                 raise HTTPException(status_code=409, detail={"error": "requested_agent_unavailable", "agent": pinned})
 
         try:
@@ -101,6 +118,15 @@ def create_job(req: CreateJobRequest) -> CreateJobResponse:
                 pinned_agent=pinned,
                 excitatory_level=lvl_i,
                 namespace=ns,
+            )
+            emit(
+                "JOB_CREATED",
+                namespace=ns,
+                job_id=str(job_id),
+                op=str(req.op),
+                pinned_agent=pinned,
+                priority=lvl_i,
+                client_job_id=str(caller_job_id) if caller_job_id else None,
             )
         except HTTPException:
             raise
