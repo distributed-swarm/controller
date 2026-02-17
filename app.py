@@ -14,13 +14,52 @@ from api.v1.events import publish_event
 from api.v1 import router as v1_router
 from lifecycle import start_reaper
 from api.v1 import AGENTS, JOBS, STATE_LOCK
+from logging_config import configure_logging
+configure_logging()
+import logging
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from pipelines.engine import run_text_pipeline
 from pipelines.spec import IntakeRequest
 from connectors.ingress_http import parse_intake_body
 from brainstem import Brainstem
 
-app = FastAPI(title="Distributed Swarm Controller")
+app = FastAPI(title="Myzel")
+log = logging.getLogger("lifecycle")
+
+class RequestContextMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Reuse upstream request id if provided, otherwise generate one.
+        request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+        request.state.request_id = request_id
+
+        t0 = time.time()
+        try:
+            response = await call_next(request)
+            return response
+        finally:
+            dt_ms = int((time.time() - t0) * 1000)
+
+            # Attach id to response so curl / clients can correlate
+            try:
+                response.headers["x-request-id"] = request_id
+            except Exception:
+                pass
+
+            log.info(
+                "http_request",
+                extra={
+                    "event": "http_request",
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status_code": getattr(locals().get("response", None), "status_code", None),
+                    "duration_ms": dt_ms,
+                    "client": request.client.host if request.client else None,
+                },
+            )
+
+app.add_middleware(RequestContextMiddleware)
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
