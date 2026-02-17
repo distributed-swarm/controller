@@ -144,7 +144,12 @@ def tombstone_agent(
     return True
 
 
-def delete_agent(name: str, deleted_at: float | None = None) -> bool:
+def delete_agent(
+    name: str,
+    deleted_at: float | None = None,
+    emit_type: str = "agent_deleted",
+) -> bool:
+
     """
     Hard-deletes an agent from app.AGENTS.
     Returns True if the agent existed and was removed.
@@ -164,7 +169,7 @@ def delete_agent(name: str, deleted_at: float | None = None) -> bool:
         entry["deleted_at"] = deleted_at if deleted_at is not None else time.time()
 
     agents.pop(name, None)
-    _emit_agent_event("agent_deleted", {"name": name})
+    _emit_agent_event(emit_type, {"name": name})
     return True
 
 
