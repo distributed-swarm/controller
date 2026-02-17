@@ -469,7 +469,7 @@ def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
             },
         )
 
-    _upsert_agent_from_lease(req, ops_norm)
+    _upsert_agent_from_lease(req, ops_norm, req.capabilities)
 
     try:
         import app as app_mod  # type: ignore
