@@ -1,8 +1,8 @@
 # controller/api/v1/audit.py
 from __future__ import annotations
 
-import time
 import hashlib
+import time
 from collections import Counter, deque
 from dataclasses import dataclass, asdict
 from typing import Any, Deque, Dict, List, Optional
@@ -13,29 +13,29 @@ from lifecycle.log import emit
 
 router = APIRouter()
 
-# Keep it bounded. Kernel-style: no unbounded memory growth.
+# Bounded, kernel-style: never unbounded memory.
 _AUDIT_MAX = 2000
+_EVENTS: Deque["AuditEvent"] = deque(maxlen=_AUDIT_MAX)
 
-# "metrics" without depending on Prometheus wiring.
+# Simple counters without requiring Prometheus wiring.
 COUNTERS: Counter = Counter()
+
 
 @dataclass(frozen=True)
 class AuditEvent:
     ts: float
-    event: str                 # "capability.accept" | "capability.coerce" | "capability.reject"
-    endpoint: str              # "/v1/leases"
+    event: str                 # capability.accept | capability.coerce | capability.reject
+    endpoint: str              # /v1/leases
     agent: str
     namespace: Optional[str]
-    shape: str                 # received shape category
-    reason_code: Optional[str] # for reject/coerce
+    shape: str                 # list | dict_ops_list | dict_ops_map | none | bad_type...
+    reason_code: Optional[str] # for reject
     warning_codes: List[str]   # for coerce
     ops_count_received: Optional[int]
     ops_count_normalized: int
     raw_hash: str              # hash of raw payload excerpt
     norm_hash: str             # hash of normalized ops set
     request_id: Optional[str] = None
-
-_EVENTS: Deque[AuditEvent] = deque(maxlen=_AUDIT_MAX)
 
 
 def _stable_hash(obj: Any) -> str:
@@ -44,7 +44,6 @@ def _stable_hash(obj: Any) -> str:
         s = repr(obj)
     except Exception:
         s = "<unrepr>"
-    # Truncate so absurd payloads don't explode memory.
     s = s[:2000]
     return hashlib.sha256(s.encode("utf-8", errors="replace")).hexdigest()
 
@@ -89,11 +88,8 @@ def record_capability_event(
     )
     _EVENTS.append(ev)
 
-    # One structured log line (your existing system can ingest this)
-    emit(
-        "CAPABILITY_AUDIT",
-        **asdict(ev),
-    )
+    # One structured log line. Your existing log pipeline can ingest this.
+    emit("CAPABILITY_AUDIT", **asdict(ev))
 
 
 @router.get("/audit/capabilities")
@@ -103,11 +99,7 @@ def get_capability_audit(
     reason_code: Optional[str] = Query(default=None),
     limit: int = Query(default=200, ge=1, le=2000),
 ) -> Dict[str, Any]:
-    """
-    Query recent capability audit events (in-memory ring buffer).
-    """
     rows = list(_EVENTS)
-
     if agent:
         rows = [r for r in rows if r.agent == agent]
     if event:
@@ -116,7 +108,6 @@ def get_capability_audit(
         rows = [r for r in rows if (r.reason_code or "") == reason_code]
 
     rows = rows[-limit:]
-
     return {
         "ok": True,
         "count": len(rows),
