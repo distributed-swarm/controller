@@ -49,6 +49,121 @@ class ForceExpireRequest(BaseModel):
     reason: str = Field(default="forced", description="Reason for forced expiry (audit/logging).")
 
 
+# -------------------------
+# Capability normalization
+# -------------------------
+
+class CapabilityReject(ValueError):
+    def __init__(self, reason_code: str, detail: Any = None):
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+        self.detail = detail
+
+
+def normalize_capabilities(raw: Any) -> tuple[List[str], str, List[str], Optional[List[str]]]:
+    """
+    Returns (ops_normalized, shape, warnings, ops_received_if_known)
+    Raises CapabilityReject on invalid forms.
+    """
+    warnings: List[str] = []
+    ops_received: Optional[List[str]] = None
+
+    if raw is None:
+        return ([], "none", warnings, ops_received)
+
+    # list[str]
+    if isinstance(raw, list):
+        ops_received = [x for x in raw if x is not None]
+        ops: List[str] = []
+        for x in ops_received:
+            # allow scalars that can stringify, reject complex types
+            if not isinstance(x, (str, int, float, bool)):
+                raise CapabilityReject("CAPS_OP_NOT_SCALAR", detail={"bad_type": str(type(x))})
+            s = str(x).strip()
+            if not s:
+                continue
+            if len(s) > 128:
+                raise CapabilityReject("CAPS_OP_TOO_LONG", detail={"op_len": len(s)})
+            # avoid whitespace/control weirdness cheaply
+            if any(ch.isspace() for ch in s):
+                # if you *want* to allow spaces, delete this.
+                raise CapabilityReject("CAPS_OP_HAS_WHITESPACE", detail={"op": s[:80]})
+            ops.append(s)
+        return (sorted(set(ops)), "list", warnings, [str(x) for x in ops_received])
+
+    # dict forms: {"ops":[...]} OR {"ops":{op:true}} OR nested {"capabilities":{...}}
+    if isinstance(raw, dict):
+        # common nesting drift
+        if "capabilities" in raw and isinstance(raw.get("capabilities"), dict):
+            warnings.append("CAPS_NESTED_CAPABILITIES")
+            raw = raw.get("capabilities")  # type: ignore[assignment]
+
+        v = raw.get("ops")
+        if v is None:
+            raise CapabilityReject("CAPS_MISSING_OPS", detail={"keys": list(raw.keys())[:20]})
+
+        # {"ops":[...]}
+        if isinstance(v, list):
+            warnings.append("CAPS_DICT_OPS_LIST")
+            ops_norm, _, w2, ops_recv = normalize_capabilities(v)
+            return (ops_norm, "dict_ops_list", warnings + w2, ops_recv)
+
+        # {"ops": {"op": true, ...}}
+        if isinstance(v, dict):
+            warnings.append("CAPS_DICT_OPS_MAP")
+            ops = []
+            for k, val in v.items():
+                if not val:
+                    continue
+                s = str(k).strip()
+                if not s:
+                    continue
+                if len(s) > 128:
+                    raise CapabilityReject("CAPS_OP_TOO_LONG", detail={"op_len": len(s)})
+                if any(ch.isspace() for ch in s):
+                    raise CapabilityReject("CAPS_OP_HAS_WHITESPACE", detail={"op": s[:80]})
+                ops.append(s)
+            return (sorted(set(ops)), "dict_ops_map", warnings, list(v.keys()))
+
+        raise CapabilityReject("CAPS_OPS_BAD_TYPE", detail={"ops_type": str(type(v))})
+
+    # Everything else is a reject.
+    raise CapabilityReject("CAPS_BAD_TYPE", detail={"type": str(type(raw))})
+
+
+def _audit_caps(
+    *,
+    event: str,
+    ns: str,
+    agent: str,
+    shape: str,
+    ops_received: Optional[List[str]],
+    ops_norm: List[str],
+    reason_code: Optional[str] = None,
+    warning_codes: Optional[List[str]] = None,
+    raw_payload: Any = None,
+) -> None:
+    try:
+        from api.v1.audit import record_capability_event
+    except Exception:
+        return
+    try:
+        record_capability_event(
+            event=event,
+            endpoint="/v1/leases",
+            agent=agent,
+            namespace=ns,
+            shape=shape,
+            ops_received=ops_received,
+            ops_normalized=ops_norm,
+            reason_code=reason_code,
+            warning_codes=warning_codes or [],
+            raw_payload=raw_payload,
+        )
+    except Exception:
+        return
+
+
 def _now_ts() -> float:
     return time.time()
 
@@ -156,9 +271,10 @@ def _publish_job_expired_event(*, namespace: str, job_id: str, lease_id: Optiona
     )
 
 
-def _upsert_agent_from_lease(req: LeaseRequest) -> None:
+def _upsert_agent_from_lease(req: LeaseRequest, ops_norm: List[str]) -> None:
     """
     Keep agent registry warm from lease requests (v1-only systems may not send heartbeats).
+    NOTE: uses *normalized* ops only. No ad-hoc parsing allowed here.
     """
     try:
         import api.v1.agents as agents_mod  # type: ignore
@@ -169,20 +285,11 @@ def _upsert_agent_from_lease(req: LeaseRequest) -> None:
     if not callable(upsert):
         return
 
-    caps = req.capabilities
-    ops: List[str] = []
-    if isinstance(caps, list):
-        ops = [str(x) for x in caps if x is not None]
-    elif isinstance(caps, dict):
-        v = caps.get("ops")
-        if isinstance(v, list):
-            ops = [str(x) for x in v if x is not None]
-
     try:
         upsert(
             req.agent,
             labels={"namespace": req.namespace},
-            capabilities={"ops": ops},
+            capabilities={"ops": ops_norm},
         )
     except Exception:
         return
@@ -312,7 +419,49 @@ def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
         ns = str(existing_ns)
     # ---------------------------------------------------------------
 
-    _upsert_agent_from_lease(req)
+    # --- Capabilities boundary: normalize + audit + strict reject ---
+    try:
+        ops_norm, shape, warnings, ops_recv = normalize_capabilities(req.capabilities)
+        _audit_caps(
+            event=("capability.coerce" if warnings else "capability.accept"),
+            ns=ns,
+            agent=req.agent,
+            shape=shape,
+            ops_received=ops_recv,
+            ops_norm=ops_norm,
+            warning_codes=warnings,
+            raw_payload=req.capabilities,
+        )
+    except CapabilityReject as e:
+        _audit_caps(
+            event="capability.reject",
+            ns=ns,
+            agent=req.agent,
+            shape=type(req.capabilities).__name__,
+            ops_received=None,
+            ops_norm=[],
+            reason_code=e.reason_code,
+            warning_codes=[],
+            raw_payload=req.capabilities,
+        )
+        emit(
+            "LEASE_REJECTED",
+            namespace=ns,
+            agent=req.agent,
+            reason="CAPABILITY_REJECTED",
+            reason_code=e.reason_code,
+            detail=getattr(e, "detail", None),
+        )
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "CAPABILITY_REJECTED",
+                "reason_code": e.reason_code,
+                "detail": getattr(e, "detail", None),
+            },
+        )
+
+    _upsert_agent_from_lease(req, ops_norm)
 
     try:
         import app as app_mod  # type: ignore
