@@ -362,7 +362,7 @@ def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
             if not _job_allows_agent(stored, req.agent):
                 return
 
-            epoch = _stamp_authoritative_lease(stored, lease_id=lease_id, now=_now_ts(), req_ttl_s=req_ttl_s)
+            epoch = _stamp_authoritative_lease(job=stored, lease_id=lease_id, now=_now_ts(), req_ttl_s=req_ttl_s)
             tasks.append(_normalize_task_from_job(stored))
 
             emit(
