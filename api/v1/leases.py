@@ -549,7 +549,7 @@ async def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
             return Response(status_code=204)
         return LeaseResponse(lease_id=lease_id, tasks=tasks)
 
-        empty_rounds = 0
+    empty_rounds = 0
     last_expire_at = 0.0
 
     while True:
