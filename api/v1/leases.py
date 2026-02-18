@@ -1,6 +1,7 @@
 # controller/api/v1/leases.py
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Union
@@ -377,7 +378,7 @@ def _stamp_authoritative_lease(*, job: Dict[str, Any], lease_id: str, now: float
 
 
 @router.post("/leases", response_model=LeaseResponse, responses={204: {"description": "No work available"}})
-def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
+async def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
     ns = (req.namespace or "").strip()
     if not ns:
         emit("LEASE_REJECTED", namespace=ns, agent=req.agent, reason="missing_namespace")
@@ -497,8 +498,6 @@ def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
     def try_lease_batch_once() -> None:
         nonlocal tasks
 
-        _expire_leases_and_bump_epochs(app_mod, _now_ts())
-
         while len(tasks) < req.max_tasks:
             leased_preview = _call_lease_next()
             if leased_preview is None:
@@ -539,11 +538,10 @@ def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
                 agent=req.agent,
                 job_epoch=epoch,
             )
-
-            _expire_leases_and_bump_epochs(app_mod, _now_ts())
-
+         
     if req.timeout_ms == 0:
         with state_lock:
+            _expire_leases_and_bump_epochs(app_mod, _now_ts())
             try_lease_batch_once()
         if not tasks:
             emit("LEASE_EMPTY", namespace=ns, agent=req.agent, max_tasks=req.max_tasks)
@@ -561,8 +559,7 @@ def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
             emit("LEASE_EMPTY", namespace=ns, agent=req.agent, max_tasks=req.max_tasks)
             return Response(status_code=204)
 
-        time.sleep(0.1)
-
+    await asyncio.sleep(0.1)
 
 @router.post("/leases/expire")
 def force_expire(req: ForceExpireRequest) -> Dict[str, Any]:
