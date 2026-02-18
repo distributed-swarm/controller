@@ -549,18 +549,37 @@ async def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
             return Response(status_code=204)
         return LeaseResponse(lease_id=lease_id, tasks=tasks)
 
+        empty_rounds = 0
+    last_expire_at = 0.0
+
     while True:
+        now = _now_ts()
+
         with state_lock:
-            _expire_leases_and_bump_epochs(app_mod, _now_ts())
+            # Expire at most every 200ms during long-poll to keep hot path cheap
+            if now - last_expire_at >= 0.2:
+                _expire_leases_and_bump_epochs(app_mod, now)
+                last_expire_at = now
+
             try_lease_batch_once()
             if tasks:
                 return LeaseResponse(lease_id=lease_id, tasks=tasks)
 
-        if _now_ts() >= deadline:
+        # No tasks found
+        if now >= deadline:
             emit("LEASE_EMPTY", namespace=ns, agent=req.agent, max_tasks=req.max_tasks)
             return Response(status_code=204)
 
-    await asyncio.sleep(0.1)
+        # Backoff + jitter prevents stampede / CPU spin
+        base = 0.02  # 20ms
+        cap = 0.25   # 250ms
+        sleep_s = min(cap, base * (2 ** min(empty_rounds, 6)))
+        sleep_s *= random.uniform(0.7, 1.3)
+
+        remaining = max(0.0, deadline - now)
+        await asyncio.sleep(min(sleep_s, remaining))
+
+        empty_rounds += 1
 
 @router.post("/leases/expire")
 def force_expire(req: ForceExpireRequest) -> Dict[str, Any]:
