@@ -837,6 +837,53 @@ def _lease_timeout_for_level(level: int) -> int:
         return 300
     return 300
 
+def _repair_job_state(job: dict) -> bool:
+    """
+    Fix impossible states in-place.
+    Returns True if the job was modified.
+    """
+    mutated = False
+
+    completed = job.get("completed_ts") is not None
+    if completed and job.get("status") == "queued":
+        job["status"] = "failed" if job.get("error") else "completed"
+        mutated = True
+
+    return mutated
+
+
+def _purge_job_from_queues(job_id: str) -> int:
+    """
+    Remove a job_id from all TASK_QUEUES.
+    Returns number of removals.
+    """
+    removed = 0
+    for q in TASK_QUEUES.values():
+        while True:
+            try:
+                q.remove(job_id)
+                removed += 1
+            except ValueError:
+                break
+    return removed
+
+def _repair_invariants() -> dict:
+    """
+    Enforce scheduler invariants:
+    - completed jobs cannot be queued
+    - completed jobs must not exist in TASK_QUEUES
+    """
+    repaired = 0
+    purged = 0
+
+    for job_id, job in list(JOBS.items()):
+        if _repair_job_state(job):
+            repaired += 1
+
+        if job.get("status") in ("completed", "failed"):
+            purged += _purge_job_from_queues(job_id)
+
+    return {"repaired": repaired, "purged": purged}
 
 def _enqueue_job(
     op: str,
