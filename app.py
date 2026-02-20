@@ -27,7 +27,36 @@ from brainstem import Brainstem
 
 app = FastAPI(title="Myzel")
 log = logging.getLogger("lifecycle")
+import os
 
+def _env(name: str, default: str) -> str:
+    v = os.getenv(name)
+    return default if v is None or v == "" else v
+
+def _log_runtime_tunables() -> None:
+    # Keep it dead-simple: just dump the env knobs we care about.
+    tunables = {
+        # Reaper / reclaim
+        "RECLAIM_INTERVAL_SEC": RECLAIM_INTERVAL_SEC,
+
+        # Health policy knobs (quarantine / heartbeat timing)
+        "HEARTBEAT_SUSPECT_AGE_SEC": (HEALTH_POLICY.get("heartbeat") or {}).get("suspect_age_sec"),
+        "HEARTBEAT_DEAD_AGE_SEC": (HEALTH_POLICY.get("heartbeat") or {}).get("dead_age_sec"),
+        "WINDOW_SIZE": (HEALTH_POLICY.get("window") or {}).get("size"),
+        "WINDOW_MIN_SAMPLES": (HEALTH_POLICY.get("window") or {}).get("min_samples"),
+        "WINDOW_DEGRADED_FAIL_RATE": (HEALTH_POLICY.get("window") or {}).get("degraded_fail_rate"),
+        "WINDOW_QUARANTINE_FAIL_RATE": (HEALTH_POLICY.get("window") or {}).get("quarantine_fail_rate"),
+        "WARMUP_SEC": WARMUP_POLICY.get("warmup_sec"),
+        "RESTART_GAP_SEC": WARMUP_POLICY.get("restart_gap_sec"),
+
+        # “Kill switches” / behavior toggles
+        "ENABLE_LATERAL_INHIBITION": ENABLE_LATERAL_INHIBITION,
+    }
+
+    log.info(
+        "RUNTIME_TUNABLES",
+        extra={"event": "RUNTIME_TUNABLES", "tunables": tunables},
+    )
 class RequestContextMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         # Reuse upstream request id if provided, otherwise generate one.
@@ -80,6 +109,7 @@ RECLAIM_INTERVAL_SEC = 30
 
 @app.on_event("startup")
 async def start_reclaimer():
+    _log_runtime_tunables()
     # “A” mode: in-memory agent reaper loop
     print("[startup] starting agent reaper")
     start_reaper(
