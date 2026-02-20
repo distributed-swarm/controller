@@ -229,6 +229,12 @@ def post_result(req: ResultRequest) -> ResultResponse:
         job["completed_ts"] = now_ts
         job["completed_at"] = _now_iso()
 
+         # Terminal jobs should not retain lease metadata.
+        job["lease_id"] = None
+        job["lease_expires_at"] = None
+        job["leased_ts"] = None
+        job["leased_by"] = None
+        
         if status_norm == "succeeded":
             job["result"] = req.result
             job["error"] = None
