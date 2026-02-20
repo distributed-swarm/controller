@@ -1,7 +1,7 @@
 # controller/api/v1/jobs.py
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Dict, Optional, Set
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -9,6 +9,96 @@ from pydantic import BaseModel, Field
 from lifecycle.log import emit
 
 router = APIRouter()
+
+
+def _ops_from_capabilities(caps: Any) -> Set[str]:
+    """
+    Best-effort extract ops from shapes seen across agents/registry:
+      - {"ops": ["echo", ...]}
+      - {"ops": {"echo": true, ...}}
+      - ["echo", ...]
+    """
+    out: Set[str] = set()
+    if caps is None:
+        return out
+
+    if isinstance(caps, dict):
+        v = caps.get("ops")
+        if isinstance(v, list):
+            for x in v:
+                s = str(x).strip() if x is not None else ""
+                if s:
+                    out.add(s)
+            return out
+        if isinstance(v, dict):
+            for k, val in v.items():
+                if not val:
+                    continue
+                s = str(k).strip()
+                if s:
+                    out.add(s)
+            return out
+        if isinstance(v, str):
+            s = v.strip()
+            if s:
+                out.add(s)
+            return out
+        return out
+
+    if isinstance(caps, list):
+        for x in caps:
+            s = str(x).strip() if x is not None else ""
+            if s:
+                out.add(s)
+        return out
+
+    return out
+
+
+def _collect_known_ops(namespace: str) -> Dict[str, Any]:
+    """
+    Attempts to read the v1 agent registry and return:
+      {
+        "ops": set[str],                    # union of all ops in the namespace
+        "by_agent": {name: set[str], ...},  # ops per agent
+        "ok": bool                          # whether we could read registry at all
+      }
+
+    IMPORTANT: if registry can't be read, we return ok=False and the caller
+    should fail-open to avoid bricking cold start.
+    """
+    ops: Set[str] = set()
+    by_agent: Dict[str, Set[str]] = {}
+
+    try:
+        # Most likely location for the in-memory registry used by /v1/agents
+        import api.v1.agents as agents_mod  # type: ignore
+    except Exception:
+        return {"ops": ops, "by_agent": by_agent, "ok": False}
+
+    store = getattr(agents_mod, "AGENTS", None) or getattr(agents_mod, "_AGENTS", None)
+    if not isinstance(store, dict):
+        return {"ops": ops, "by_agent": by_agent, "ok": False}
+
+    # store might be either:
+    #   { "default": { "cpu-1": {...}, ... }, ... }
+    # or:
+    #   { "cpu-1": {...}, ... }  (flat)
+    ns_bucket = store.get(namespace) if namespace in store else None
+    items = ns_bucket.items() if isinstance(ns_bucket, dict) else store.items()
+
+    for name, info in items:
+        if not isinstance(info, dict):
+            continue
+        caps = info.get("capabilities")
+        aops = _ops_from_capabilities(caps)
+        if not aops:
+            continue
+        aname = str(name)
+        by_agent[aname] = aops
+        ops |= aops
+
+    return {"ops": ops, "by_agent": by_agent, "ok": True}
 
 
 class JobConstraints(BaseModel):
@@ -44,11 +134,18 @@ def create_job(req: CreateJobRequest) -> CreateJobResponse:
     v1 job submission.
 
     This is the missing syscall: create a job so it can be leased via POST /v1/leases.
+
+    FIX: Validate op at submission time to avoid "accepted bad job that can never lease".
     """
     ns = (req.namespace or "").strip()
     if not ns:
         emit("JOB_REJECTED", namespace=ns, reason="missing_namespace", op=req.op)
         raise HTTPException(status_code=400, detail="namespace is required")
+
+    op_name = (req.op or "").strip()
+    if not op_name:
+        emit("JOB_REJECTED", namespace=ns, reason="missing_op", op=req.op)
+        raise HTTPException(status_code=400, detail="op is required")
 
     try:
         import app as app_mod  # type: ignore
@@ -83,6 +180,52 @@ def create_job(req: CreateJobRequest) -> CreateJobResponse:
     caller_job_id = req.job_id or req.id
 
     with state_lock:
+        # ----------------------------
+        # FIX: submit-time op validation
+        # ----------------------------
+        known = _collect_known_ops(ns)
+        known_ops: Set[str] = set(known.get("ops") or set())
+        by_agent: Dict[str, Set[str]] = dict(known.get("by_agent") or {})
+        registry_ok: bool = bool(known.get("ok"))
+
+        # Fail-open only if we couldn't read registry at all (cold start / module mismatch).
+        # If registry is readable AND has any ops, enforce validation.
+        if registry_ok and known_ops:
+            if op_name not in known_ops:
+                emit("JOB_REJECTED", namespace=ns, reason="UNKNOWN_OP", op=op_name, pinned_agent=pinned)
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "UNKNOWN_OP",
+                        "op": op_name,
+                        "namespace": ns,
+                        "hint": "Call /v1/agents?namespace=... to see supported ops.",
+                        "available_ops_sample": sorted(list(known_ops))[:200],
+                    },
+                )
+
+            if pinned:
+                aops = by_agent.get(str(pinned))
+                # If we know this agent and it can't run the op, reject immediately.
+                if aops is not None and op_name not in aops:
+                    emit(
+                        "JOB_REJECTED",
+                        namespace=ns,
+                        reason="PINNED_AGENT_CANNOT_RUN_OP",
+                        op=op_name,
+                        pinned_agent=pinned,
+                    )
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "error": "PINNED_AGENT_CANNOT_RUN_OP",
+                            "op": op_name,
+                            "agent": pinned,
+                            "namespace": ns,
+                        },
+                    )
+
+        # Existing pinned availability check (liveness/health)
         if pinned:
             try:
                 if not bool(is_avail(pinned)):
@@ -91,7 +234,7 @@ def create_job(req: CreateJobRequest) -> CreateJobResponse:
                         namespace=ns,
                         reason="requested_agent_unavailable",
                         pinned_agent=pinned,
-                        op=req.op,
+                        op=op_name,
                     )
                     raise HTTPException(
                         status_code=409,
@@ -106,13 +249,13 @@ def create_job(req: CreateJobRequest) -> CreateJobResponse:
                     namespace=ns,
                     reason="requested_agent_unavailable",
                     pinned_agent=pinned,
-                    op=req.op,
+                    op=op_name,
                 )
                 raise HTTPException(status_code=409, detail={"error": "requested_agent_unavailable", "agent": pinned})
 
         try:
             job_id = enqueue(
-                op=str(req.op),
+                op=str(op_name),
                 payload=req.payload,
                 job_id=str(caller_job_id) if caller_job_id else None,
                 pinned_agent=pinned,
@@ -123,7 +266,7 @@ def create_job(req: CreateJobRequest) -> CreateJobResponse:
                 "JOB_CREATED",
                 namespace=ns,
                 job_id=str(job_id),
-                op=str(req.op),
+                op=str(op_name),
                 pinned_agent=pinned,
                 priority=lvl_i,
                 client_job_id=str(caller_job_id) if caller_job_id else None,
