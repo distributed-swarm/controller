@@ -562,6 +562,7 @@ async def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
          
     if req.timeout_ms == 0:
         with state_lock:
+            app_mod._repair_invariants()
             _expire_leases_and_bump_epochs(app_mod, _now_ts())
             try_lease_batch_once()
         if not tasks:
@@ -576,6 +577,7 @@ async def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
         now = _now_ts()
 
         with state_lock:
+            app_mod._repair_invariants() 
             # Expire at most every 200ms during long-poll to keep hot path cheap
             if now - last_expire_at >= 0.2:
                 _expire_leases_and_bump_epochs(app_mod, now)
