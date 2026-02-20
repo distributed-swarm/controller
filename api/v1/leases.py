@@ -329,6 +329,26 @@ def _expire_leases_and_bump_epochs(app_mod: Any, now_ts: float) -> None:
         prev_lease_id = job.get("lease_id")
         ns = job.get("namespace") or job.get("labels", {}).get("namespace") or "default"
 
+        # --- TERMINAL GUARD: never resurrect finished jobs ---
+        state = str(job.get("state") or "").lower()
+        status = str(job.get("status") or "").lower()
+
+        is_terminal = (
+            state in ("succeeded", "failed", "completed")
+            or status in ("completed", "succeeded", "failed")
+            or job.get("completed_at") is not None
+            or job.get("completed_ts") is not None
+            or job.get("result") is not None
+            or job.get("error") is not None
+        )
+
+        if is_terminal:
+            # If a terminal job somehow still has a lease expiry, scrub lease fields and move on.
+            job["lease_id"] = None
+            job["lease_expires_at"] = None
+            job["leased_ts"] = None
+            job["leased_by"] = None
+            continue
         try:
             job["job_epoch"] = int(job.get("job_epoch") or 1) + 1
         except (TypeError, ValueError):
