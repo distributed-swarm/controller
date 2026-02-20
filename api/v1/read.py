@@ -137,9 +137,13 @@ class JobsListResponse(BaseModel):
     jobs: List[Dict[str, Any]]
 
 
+# PATCH: namespace is OPTIONAL for GET by id (defaults to "default")
 @router.get("/jobs/{job_id}", response_model=Dict[str, Any])
-def get_job(job_id: str, namespace: str = Query(..., description="Namespace (required)")) -> Dict[str, Any]:
-    ns = _require_namespace(namespace)
+def get_job(
+    job_id: str,
+    namespace: str = Query("default", description="Namespace (optional; defaults to 'default')"),
+) -> Dict[str, Any]:
+    ns = (namespace or "default").strip()
     jobs, _agents = _load_stores()
 
     job = jobs.get(job_id)
