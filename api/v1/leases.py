@@ -577,7 +577,7 @@ async def lease_work(req: LeaseRequest) -> Response | LeaseResponse:
         now = _now_ts()
 
         with state_lock:
-            app_mod._repair_invariants() 
+            app_mod._repair_invariants()
             # Expire at most every 200ms during long-poll to keep hot path cheap
             if now - last_expire_at >= 0.2:
                 _expire_leases_and_bump_epochs(app_mod, now)
