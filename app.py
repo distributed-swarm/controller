@@ -52,7 +52,7 @@ def _log_runtime_tunables() -> None:
         # “Kill switches” / behavior toggles
         "ENABLE_LATERAL_INHIBITION": ENABLE_LATERAL_INHIBITION,
     }
-
+    print(f"[startup] RUNTIME_TUNABLES {tunables}")
     log.info(
         "RUNTIME_TUNABLES",
         extra={"event": "RUNTIME_TUNABLES", "tunables": tunables},
